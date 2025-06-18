@@ -1,33 +1,50 @@
 import openai
 import uuid
 
-def semantic_chunking(document_text: str, model: str = "gpt-4o") -> dict:
+def merge_and_format_process_guidance_chunks(json_data: dict, model: str = "gpt-4o") -> dict:
+    # 1. Filter and combine all process_guidance chunks
+    guidance_chunks = [
+        chunk["content"] for chunk in json_data.get("semanticChunks", [])
+        if chunk.get("chunkType") == "step_by_step_procedure"
+    ]
+
+    if not guidance_chunks:
+        return {"error": "No process guidance chunks found."}
+
+    combined_content = "\n\n".join(guidance_chunks)
+
+    # 2. Pass combined content through ChatCompletions to clean up formatting
     prompt = f"""
-You are an AI document processor. Your job is to semantically chunk the document into meaningful sections.
+You are a document formatting assistant.
 
-**Goal**:
-Split the document into sections such as:
-- Step-by-step procedures (MUST be in a separate chunk if present)
-- Information retrieval-related sections
-- Summaries
-- Any other semantically unique sections
+Below is a combined set of step-by-step procedures extracted from a technical document. Please:
+- Clean up the formatting
+- Preserve the order of steps
+- Use numbered or bulleted lists where appropriate
+- Add proper headings or subheadings if necessary
+- Ensure the final version is suitable for inclusion in a professional technical document.
 
-Return the result in the following JSON format:
-```json
-{{
-  "documentTitle": "Title of the Document",
-  "semanticChunks": [
-    {{
-      "chunkId": "uuid-generated-chunk-id",
-      "chunkType": "step_by_step_procedure",
-      "chunkTitle": "How to Configure XYZ",
-      "content": "The detailed step-by-step instructions..."
-    }},
-    {{
-      "chunkId": "uuid-generated-chunk-id",
-      "chunkType": "information_retrieval",
-      "chunkTitle": "Overview of IR Techniques",
-      "content": "This section talks about..."
-    }}
-  ]
-}}
+### Raw Input:
+\"\"\"{combined_content}\"\"\"
+"""
+
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are an expert technical document formatter."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+
+    formatted_output = response.choices[0].message["content"]
+
+    # 3. Return as a single new chunk
+    merged_chunk = {
+        "chunkId": str(uuid.uuid4()),
+        "chunkType": "step_by_step_procedure",
+        "chunkTitle": "Merged and Formatted Step-by-Step Procedure",
+        "content": formatted_output
+    }
+
+    return merged_chunk
