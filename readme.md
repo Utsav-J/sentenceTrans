@@ -1,29 +1,296 @@
-You are an intelligent routing assistant that receives user queries along with an explicit intent label.
+import asyncio
+import chainlit as cl
+from mcp.client.streamable_http import streamableHttpClient
+from dotenv import load_dotenv
+from mcp import ClientSession
+from langchain.prebuilt import load_mcp_tools
+from langchain_mcp_adapters.tools import create_react_agent
+from tachyon_langchain_client import TachyonLangchainClient
+from langchain_core.messages import ToolMessage, HumanMessage, AIMessage
+import weakref
+import json
 
-Your task is to decide whether to:
-1. Answer the user query yourself using your general knowledge, OR
-2. Delegate the task to an external MCP tool based on the intent.
+load_dotenv()
 
-There are two categories of intent:
+server_url = "http://localhost:8081/mcp"
 
-PRIMARY INTENTS:
-- These indicate search or data retrieval requests.
-- If the intent belongs to this list, delegate to the MCP Search API Server by calling the tool named `search_api_tool`.
+# System prompt for guiding tool usage
+SYSTEM_PROMPT = """You are a helpful AI assistant with access to specialized tools through MCP (Model Context Protocol).
 
-SECONDARY INTENTS:
-- These relate to conversational or guidance-based tasks.
-- If the intent belongs to this list, delegate to the MCP ChatServiceServer by calling the tool named `chat_service_tool`.
+**When to use tools:**
+- Use tools for tasks that require real-time data, external APIs, or specialized computations
+- Use tools for file operations, database queries, web searches, or system interactions
+- Use tools when you need to retrieve current information or perform actions you cannot do directly
+- Use tools for domain-specific tasks that your available tools are designed for
 
-If the intent is not recognized or falls outside these categories, attempt to answer the query yourself using your capabilities.
+**When to respond directly:**
+- Answer general knowledge questions from your training data
+- Provide explanations, definitions, or educational content
+- Engage in conversation, creative writing, or brainstorming
+- Perform simple calculations or reasoning that don't require external data
+- Give advice or opinions based on your training
 
-Always use the intent provided to you as guidance.
-Only call a tool if the intent explicitly matches one of the listed intents.
+**Tool usage guidelines:**
+- Always examine what tools are available to you first
+- Use the most appropriate tool for the specific task
+- Combine multiple tools if needed for complex workflows
+- Explain your reasoning when choosing to use or not use tools
+- If a tool fails, try alternative approaches or explain the limitation
 
-Do not make assumptions about server use beyond the intent mapping.
+Be efficient and thoughtful: use tools when they add value, but respond directly when you can provide accurate information from your knowledge base."""
 
-Return the response appropriately:
-- If delegating, call the tool and return its result.
-- If answering yourself, generate a helpful and accurate response.
+model_client = TachyonLangchainClient(model_name="gemini-2.0-flash")
 
-PRIMARY INTENTS: ["search_documents", "lookup_procedure", "fetch_summary"]
-SECONDARY INTENTS: ["ask_guidance", "explain_topic", "small_talk"]
+# Store active connections per session
+def extract_tool_context(messages):
+    """Extract context from ToolMessage for enhanced AI response"""
+    # 1. Detect if ToolMessage is present
+    tool_call_made = any(isinstance(item, ToolMessage) for item in messages)
+    
+    if not tool_call_made:
+        return None, None
+    
+    # 2. Extract the ToolMessage (if any)
+    tool_message = next((m for m in messages if isinstance(m, ToolMessage)), None)
+    
+    if not tool_message:
+        return None, None
+    
+    try:
+        # 3. Parse and extract what you need
+        tool_data = json.loads(tool_message.content)
+        
+        # 4. Extract specific info (e.g., from RAG hits)
+        extracted_chunks = []
+        document_urls = []
+        
+        for chunk in tool_data.get("result", {}).get("hits", []):
+            title = chunk["record"].get("title", "Unknown Document")
+            context = chunk["record"].get("raw_context", "")
+            url = chunk["record"].get("url", "")
+            
+            if context:
+                extracted_chunks.append(f"📘 {title}\n{context}\n" + "*" * 20)
+            
+            if url and url not in document_urls:
+                document_urls.append(url)
+        
+        # 5. Combine extracted chunks
+        final_chunk_text = "\n\n".join(extracted_chunks) if extracted_chunks else None
+        
+        return final_chunk_text, document_urls
+        
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        print(f"Error parsing tool message: {e}")
+        return None, None
+
+async def enhance_message_with_context(messages, extracted_context, document_urls):
+    """Add extracted context to the conversation for better AI response"""
+    if not extracted_context:
+        return messages
+    
+    # Find the last user message and enhance it with context
+    enhanced_messages = messages.copy()
+    
+    # Add context information before the final AI response
+    context_message = {
+        "role": "system", 
+        "content": f"""Based on the tool search results, here is the relevant context that should inform your response:
+
+EXTRACTED CONTEXT:
+{extracted_context}
+
+DOCUMENT SOURCES:
+{', '.join(document_urls) if document_urls else 'No URLs available'}
+
+Please use this context to provide a comprehensive and accurate response to the user's query. Reference the specific information from these sources when relevant."""
+    }
+    
+    # Insert context message before the last AI message generation
+    enhanced_messages.append(context_message)
+    
+    # Store active connections per session
+active_connections = {}
+
+async def create_mcp_session():
+    """Create and initialize MCP session with proper error handling"""
+    try:
+        # Create the HTTP client
+        http_client = streamableHttpClient(server_url)
+        read, write, close_func = await http_client.__aenter__()
+        
+        # Create the client session
+        client_session = ClientSession(read, write)
+        session = await client_session.__aenter__()
+        await session.initialize()
+        
+        # Load tools and create agent
+        tools = await load_mcp_tools(session)
+        agent = create_react_agent(model_client, tools)
+        
+        return {
+            'http_client': http_client,
+            'client_session': client_session,
+            'session': session,
+            'agent': agent,
+            'close_func': close_func
+        }
+    except Exception as e:
+        print(f"Error creating MCP session: {e}")
+        raise
+
+async def cleanup_connection(connection_info):
+    """Safely cleanup MCP connection"""
+    try:
+        if 'client_session' in connection_info:
+            await connection_info['client_session'].__aexit__(None, None, None)
+        if 'http_client' in connection_info:
+            await connection_info['http_client'].__aexit__(None, None, None)
+        if 'close_func' in connection_info:
+            await connection_info['close_func']()
+    except Exception as e:
+        print(f"Error during cleanup: {e}")
+
+@cl.on_chat_start
+async def start():
+    """Initialize the MCP session and agent when chat starts"""
+    # Show loading message
+    msg = cl.Message(content="🔧 Initializing Vantage Chat Agent...")
+    await msg.send()
+    
+    try:
+        # Create MCP session
+        connection_info = await create_mcp_session()
+        
+        # Store connection info in user session
+        cl.user_session.set("connection_info", connection_info)
+        cl.user_session.set("message_history", [])
+        
+        # Store in global dict for cleanup (using session id as key)
+        session_id = cl.user_session.get("id")
+        active_connections[session_id] = connection_info
+        
+        # Update message to show ready state
+        await msg.update(content="✅ Vantage Chat Agent is ready! Ask me anything.")
+        
+    except Exception as e:
+        await msg.update(content=f"❌ Failed to initialize agent: {str(e)}")
+        print(f"Initialization error: {e}")
+
+@cl.on_message
+async def main(message: cl.Message):
+    """Handle incoming messages"""
+    connection_info = cl.user_session.get("connection_info")
+    
+    if not connection_info or 'agent' not in connection_info:
+        await cl.Message(content="❌ Agent not initialized. Please refresh the page.").send()
+        return
+    
+    # Show typing indicator
+    async with cl.Step(name="thinking", type="run") as step:
+        step.output = "Processing your message..."
+        
+        try:
+            # Get conversation history
+            message_history = cl.user_session.get("message_history", [])
+            
+            # Add system prompt to the beginning if this is the first message
+            if not message_history:
+                message_history.append({"role": "system", "content": SYSTEM_PROMPT})
+            
+            # Add current user message
+            message_history.append({"role": "user", "content": message.content})
+            
+            # Get agent response (this will include tool calls if needed)
+            agent = connection_info['agent']
+            response = await agent.ainvoke({"messages": message_history})
+            
+            # Extract the full message chain from the agent response
+            # The agent response contains the complete conversation including tool calls
+            full_messages = response.get("messages", []) if isinstance(response, dict) else []
+            
+            # If we don't have the full message chain, fall back to the response content
+            if not full_messages:
+                # Add assistant response to history
+                message_history.append({"role": "assistant", "content": str(response)})
+                cl.user_session.set("message_history", message_history)
+                step.output = "Response generated!"
+            else:
+                # Extract context from tool messages if present
+                extracted_context, document_urls = extract_tool_context(full_messages)
+                
+                if extracted_context:
+                    # Show extracted context in a collapsible section
+                    context_msg = cl.Message(
+                        content=f"**📚 Retrieved Context:**\n\n{extracted_context}",
+                        author="System"
+                    )
+                    await context_msg.send()
+                    
+                    if document_urls:
+                        urls_text = "\n".join([f"• {url}" for url in document_urls])
+                        urls_msg = cl.Message(
+                            content=f"**🔗 Source Documents:**\n{urls_text}",
+                            author="System"
+                        )
+                        await urls_msg.send()
+                
+                # Enhance messages with context for better final response
+                enhanced_messages = await enhance_message_with_context(
+                    message_history, extracted_context, document_urls
+                )
+                
+                # Generate enhanced response with context
+                if extracted_context:
+                    final_response = await agent.ainvoke({"messages": enhanced_messages})
+                    response = final_response
+                
+                # Add assistant response to history
+                message_history.append({"role": "assistant", "content": str(response)})
+                cl.user_session.set("message_history", message_history)
+                step.output = "Response generated with enhanced context!"
+            
+        except Exception as e:
+            step.output = f"Error: {str(e)}"
+            response = f"❌ Sorry, I encountered an error: {str(e)}"
+            print(f"Message processing error: {e}")
+    
+    # Send the response
+    await cl.Message(content=str(response)).send()
+
+@cl.on_chat_end
+async def end():
+    """Clean up when chat ends"""
+    session_id = cl.user_session.get("id")
+    
+    if session_id in active_connections:
+        connection_info = active_connections[session_id]
+        await cleanup_connection(connection_info)
+        del active_connections[session_id]
+
+@cl.on_stop
+async def stop():
+    """Clean up all connections when server stops"""
+    cleanup_tasks = []
+    for connection_info in active_connections.values():
+        cleanup_tasks.append(cleanup_connection(connection_info))
+    
+    if cleanup_tasks:
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+    
+    active_connections.clear()
+
+if __name__ == "__main__":
+    try:
+        cl.run()
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        # Ensure cleanup on exit
+        if active_connections:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                for connection_info in active_connections.values():
+                    asyncio.create_task(cleanup_connection(connection_info))
+            else:
+                asyncio.run(stop())
