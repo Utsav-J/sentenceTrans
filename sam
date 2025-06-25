@@ -1,0 +1,79 @@
+import asyncio
+from typing import List
+from typing_extensions import TypedDict
+from typing import Annotated
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.prebuilt import tools_condition, ToolNode
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import AnyMessage, add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configure the two MCP servers
+client = MultiServerMCPClient(
+    {
+        "mcp1": {
+            "url": "http://localhost:8001/mcp",
+            "transport": "streamable_http",
+        },
+        "mcp2": {
+            "url": "http://localhost:8002/mcp",
+            "transport": "streamable_http",
+        },
+    }
+)
+
+# System prompt with routing logic
+SYSTEM_PROMPT = """
+You are an intelligent assistant with access to two tool servers:
+- For any general queries like searching, use tools from MCP1.
+- For foreign exchange related queries, use tools from MCP2.
+Always choose the correct tool based on the user's intent. If a query requires both, call both tools and combine their responses.
+"""
+
+async def create_graph():
+    # Initialize the LLM
+    llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+    # Load all tools from both servers
+    tools = await client.get_tools()
+    llm_with_tool = llm.bind_tools(tools)
+    # Set up the prompt
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        MessagesPlaceholder("messages")
+    ])
+    chat_llm = prompt_template | llm_with_tool
+
+    # State management
+    class State(TypedDict):
+        messages: Annotated[List[AnyMessage], add_messages]
+
+    # Chat node
+    def chat_node(state: State) -> State:
+        state["messages"] = chat_llm.invoke({"messages": state["messages"]})
+        return state
+
+    # Build the graph
+    graph_builder = StateGraph(State)
+    graph_builder.add_node("chat_node", chat_node)
+    graph_builder.add_node("tool_node", ToolNode(tools=tools))
+    graph_builder.add_edge(START, "chat_node")
+    graph_builder.add_conditional_edges("chat_node", tools_condition, {"tools": "tool_node", "__end__": END})
+    graph_builder.add_edge("tool_node", "chat_node")
+    graph = graph_builder.compile(checkpointer=MemorySaver())
+    return graph
+
+async def main():
+    config = {"configurable": {"thread_id": 1234}}
+    agent = await create_graph()
+    while True:
+        message = input("User: ")
+        response = await agent.ainvoke({"messages": message}, config=config)
+        print("AI: "+response["messages"][-1].content)
+
+if __name__ == "__main__":
+    asyncio.run(main())
