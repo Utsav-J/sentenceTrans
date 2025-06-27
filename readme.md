@@ -1,296 +1,294 @@
-import asyncio
+To implement context/memory reset logic based on whether a question is a follow-up or not, you'll need to detect the nature of the question and manage your memory accordingly. Here are several approaches:
+
+## Method 1: Using Keywords and Context Clues
+
+```python
 import chainlit as cl
-from mcp.client.streamable_http import streamableHttpClient
-from dotenv import load_dotenv
-from mcp import ClientSession
-from langchain.prebuilt import load_mcp_tools
-from langchain_mcp_adapters.tools import create_react_agent
-from tachyon_langchain_client import TachyonLangchainClient
-from langchain_core.messages import ToolMessage, HumanMessage, AIMessage
-import weakref
-import json
+from datetime import datetime, timedelta
 
-load_dotenv()
+# Store conversation state
+conversation_memory = []
+last_message_time = None
 
-server_url = "http://localhost:8081/mcp"
-
-# System prompt for guiding tool usage
-SYSTEM_PROMPT = """You are a helpful AI assistant with access to specialized tools through MCP (Model Context Protocol).
-
-**When to use tools:**
-- Use tools for tasks that require real-time data, external APIs, or specialized computations
-- Use tools for file operations, database queries, web searches, or system interactions
-- Use tools when you need to retrieve current information or perform actions you cannot do directly
-- Use tools for domain-specific tasks that your available tools are designed for
-
-**When to respond directly:**
-- Answer general knowledge questions from your training data
-- Provide explanations, definitions, or educational content
-- Engage in conversation, creative writing, or brainstorming
-- Perform simple calculations or reasoning that don't require external data
-- Give advice or opinions based on your training
-
-**Tool usage guidelines:**
-- Always examine what tools are available to you first
-- Use the most appropriate tool for the specific task
-- Combine multiple tools if needed for complex workflows
-- Explain your reasoning when choosing to use or not use tools
-- If a tool fails, try alternative approaches or explain the limitation
-
-Be efficient and thoughtful: use tools when they add value, but respond directly when you can provide accurate information from your knowledge base."""
-
-model_client = TachyonLangchainClient(model_name="gemini-2.0-flash")
-
-# Store active connections per session
-def extract_tool_context(messages):
-    """Extract context from ToolMessage for enhanced AI response"""
-    # 1. Detect if ToolMessage is present
-    tool_call_made = any(isinstance(item, ToolMessage) for item in messages)
+def is_followup_question(message: str, previous_context: list) -> bool:
+    """Determine if the message is a follow-up question"""
     
-    if not tool_call_made:
-        return None, None
+    # Keywords that typically indicate follow-ups
+    followup_indicators = [
+        'also', 'additionally', 'furthermore', 'moreover', 'and',
+        'what about', 'how about', 'can you also', 'tell me more',
+        'explain further', 'elaborate', 'continue', 'go on',
+        'that', 'this', 'it', 'they', 'them'  # pronouns referring to previous context
+    ]
     
-    # 2. Extract the ToolMessage (if any)
-    tool_message = next((m for m in messages if isinstance(m, ToolMessage)), None)
+    # Check for pronouns and references
+    pronoun_references = ['it', 'this', 'that', 'these', 'those', 'they', 'them']
     
-    if not tool_message:
-        return None, None
+    message_lower = message.lower()
     
-    try:
-        # 3. Parse and extract what you need
-        tool_data = json.loads(tool_message.content)
-        
-        # 4. Extract specific info (e.g., from RAG hits)
-        extracted_chunks = []
-        document_urls = []
-        
-        for chunk in tool_data.get("result", {}).get("hits", []):
-            title = chunk["record"].get("title", "Unknown Document")
-            context = chunk["record"].get("raw_context", "")
-            url = chunk["record"].get("url", "")
-            
-            if context:
-                extracted_chunks.append(f"📘 {title}\n{context}\n" + "*" * 20)
-            
-            if url and url not in document_urls:
-                document_urls.append(url)
-        
-        # 5. Combine extracted chunks
-        final_chunk_text = "\n\n".join(extracted_chunks) if extracted_chunks else None
-        
-        return final_chunk_text, document_urls
-        
-    except (json.JSONDecodeError, KeyError, AttributeError) as e:
-        print(f"Error parsing tool message: {e}")
-        return None, None
+    # Check for explicit follow-up indicators
+    for indicator in followup_indicators:
+        if indicator in message_lower:
+            return True
+    
+    # Check for pronouns that likely refer to previous context
+    if any(pronoun in message_lower.split()[:5] for pronoun in pronoun_references):
+        return True
+    
+    # Check if message is very short (likely a follow-up)
+    if len(message.split()) <= 3 and previous_context:
+        return True
+    
+    return False
 
-async def enhance_message_with_context(messages, extracted_context, document_urls):
-    """Add extracted context to the conversation for better AI response"""
-    if not extracted_context:
-        return messages
+def is_time_based_continuation() -> bool:
+    """Check if message came within a short time window"""
+    global last_message_time
     
-    # Find the last user message and enhance it with context
-    enhanced_messages = messages.copy()
+    if last_message_time is None:
+        return False
     
-    # Add context information before the final AI response
-    context_message = {
-        "role": "system", 
-        "content": f"""Based on the tool search results, here is the relevant context that should inform your response:
-
-EXTRACTED CONTEXT:
-{extracted_context}
-
-DOCUMENT SOURCES:
-{', '.join(document_urls) if document_urls else 'No URLs available'}
-
-Please use this context to provide a comprehensive and accurate response to the user's query. Reference the specific information from these sources when relevant."""
-    }
-    
-    # Insert context message before the last AI message generation
-    enhanced_messages.append(context_message)
-    
-    # Store active connections per session
-active_connections = {}
-
-async def create_mcp_session():
-    """Create and initialize MCP session with proper error handling"""
-    try:
-        # Create the HTTP client
-        http_client = streamableHttpClient(server_url)
-        read, write, close_func = await http_client.__aenter__()
-        
-        # Create the client session
-        client_session = ClientSession(read, write)
-        session = await client_session.__aenter__()
-        await session.initialize()
-        
-        # Load tools and create agent
-        tools = await load_mcp_tools(session)
-        agent = create_react_agent(model_client, tools)
-        
-        return {
-            'http_client': http_client,
-            'client_session': client_session,
-            'session': session,
-            'agent': agent,
-            'close_func': close_func
-        }
-    except Exception as e:
-        print(f"Error creating MCP session: {e}")
-        raise
-
-async def cleanup_connection(connection_info):
-    """Safely cleanup MCP connection"""
-    try:
-        if 'client_session' in connection_info:
-            await connection_info['client_session'].__aexit__(None, None, None)
-        if 'http_client' in connection_info:
-            await connection_info['http_client'].__aexit__(None, None, None)
-        if 'close_func' in connection_info:
-            await connection_info['close_func']()
-    except Exception as e:
-        print(f"Error during cleanup: {e}")
-
-@cl.on_chat_start
-async def start():
-    """Initialize the MCP session and agent when chat starts"""
-    # Show loading message
-    msg = cl.Message(content="🔧 Initializing Vantage Chat Agent...")
-    await msg.send()
-    
-    try:
-        # Create MCP session
-        connection_info = await create_mcp_session()
-        
-        # Store connection info in user session
-        cl.user_session.set("connection_info", connection_info)
-        cl.user_session.set("message_history", [])
-        
-        # Store in global dict for cleanup (using session id as key)
-        session_id = cl.user_session.get("id")
-        active_connections[session_id] = connection_info
-        
-        # Update message to show ready state
-        await msg.update(content="✅ Vantage Chat Agent is ready! Ask me anything.")
-        
-    except Exception as e:
-        await msg.update(content=f"❌ Failed to initialize agent: {str(e)}")
-        print(f"Initialization error: {e}")
+    time_diff = datetime.now() - last_message_time
+    return time_diff < timedelta(minutes=2)  # Adjust threshold as needed
 
 @cl.on_message
 async def main(message: cl.Message):
-    """Handle incoming messages"""
-    connection_info = cl.user_session.get("connection_info")
+    global conversation_memory, last_message_time
     
-    if not connection_info or 'agent' not in connection_info:
-        await cl.Message(content="❌ Agent not initialized. Please refresh the page.").send()
-        return
+    user_message = message.content
     
-    # Show typing indicator
-    async with cl.Step(name="thinking", type="run") as step:
-        step.output = "Processing your message..."
-        
-        try:
-            # Get conversation history
-            message_history = cl.user_session.get("message_history", [])
-            
-            # Add system prompt to the beginning if this is the first message
-            if not message_history:
-                message_history.append({"role": "system", "content": SYSTEM_PROMPT})
-            
-            # Add current user message
-            message_history.append({"role": "user", "content": message.content})
-            
-            # Get agent response (this will include tool calls if needed)
-            agent = connection_info['agent']
-            response = await agent.ainvoke({"messages": message_history})
-            
-            # Extract the full message chain from the agent response
-            # The agent response contains the complete conversation including tool calls
-            full_messages = response.get("messages", []) if isinstance(response, dict) else []
-            
-            # If we don't have the full message chain, fall back to the response content
-            if not full_messages:
-                # Add assistant response to history
-                message_history.append({"role": "assistant", "content": str(response)})
-                cl.user_session.set("message_history", message_history)
-                step.output = "Response generated!"
-            else:
-                # Extract context from tool messages if present
-                extracted_context, document_urls = extract_tool_context(full_messages)
-                
-                if extracted_context:
-                    # Show extracted context in a collapsible section
-                    context_msg = cl.Message(
-                        content=f"**📚 Retrieved Context:**\n\n{extracted_context}",
-                        author="System"
-                    )
-                    await context_msg.send()
-                    
-                    if document_urls:
-                        urls_text = "\n".join([f"• {url}" for url in document_urls])
-                        urls_msg = cl.Message(
-                            content=f"**🔗 Source Documents:**\n{urls_text}",
-                            author="System"
-                        )
-                        await urls_msg.send()
-                
-                # Enhance messages with context for better final response
-                enhanced_messages = await enhance_message_with_context(
-                    message_history, extracted_context, document_urls
-                )
-                
-                # Generate enhanced response with context
-                if extracted_context:
-                    final_response = await agent.ainvoke({"messages": enhanced_messages})
-                    response = final_response
-                
-                # Add assistant response to history
-                message_history.append({"role": "assistant", "content": str(response)})
-                cl.user_session.set("message_history", message_history)
-                step.output = "Response generated with enhanced context!"
-            
-        except Exception as e:
-            step.output = f"Error: {str(e)}"
-            response = f"❌ Sorry, I encountered an error: {str(e)}"
-            print(f"Message processing error: {e}")
+    # Determine if this is a follow-up
+    is_followup = (
+        is_followup_question(user_message, conversation_memory) or 
+        is_time_based_continuation()
+    )
     
-    # Send the response
-    await cl.Message(content=str(response)).send()
+    if not is_followup:
+        # Reset memory for new conversation
+        conversation_memory = []
+        await cl.Message(content="🔄 Starting new conversation context...").send()
+    
+    # Add current message to memory
+    conversation_memory.append({
+        "role": "user",
+        "content": user_message,
+        "timestamp": datetime.now()
+    })
+    
+    # Generate response using memory
+    response = generate_response(user_message, conversation_memory if is_followup else [])
+    
+    # Add response to memory
+    conversation_memory.append({
+        "role": "assistant", 
+        "content": response,
+        "timestamp": datetime.now()
+    })
+    
+    # Update timestamp
+    last_message_time = datetime.now()
+    
+    # Send response
+    await cl.Message(content=response).send()
+```
 
-@cl.on_chat_end
-async def end():
-    """Clean up when chat ends"""
-    session_id = cl.user_session.get("id")
-    
-    if session_id in active_connections:
-        connection_info = active_connections[session_id]
-        await cleanup_connection(connection_info)
-        del active_connections[session_id]
+## Method 2: Using User Session State
 
-@cl.on_stop
-async def stop():
-    """Clean up all connections when server stops"""
-    cleanup_tasks = []
-    for connection_info in active_connections.values():
-        cleanup_tasks.append(cleanup_connection(connection_info))
-    
-    if cleanup_tasks:
-        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-    
-    active_connections.clear()
+```python
+import chainlit as cl
 
-if __name__ == "__main__":
-    try:
-        cl.run()
-    except KeyboardInterrupt:
-        print("Shutting down...")
-    finally:
-        # Ensure cleanup on exit
-        if active_connections:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                for connection_info in active_connections.values():
-                    asyncio.create_task(cleanup_connection(connection_info))
-            else:
-                asyncio.run(stop())
+@cl.on_chat_start
+async def start():
+    # Initialize session state
+    cl.user_session.set("conversation_memory", [])
+    cl.user_session.set("last_topic", None)
+    cl.user_session.set("message_count", 0)
+
+def detect_topic_change(current_message: str, last_topic: str) -> bool:
+    """Simple topic change detection"""
+    if not last_topic:
+        return True
+    
+    # You can implement more sophisticated topic modeling here
+    # For now, using simple keyword overlap
+    current_words = set(current_message.lower().split())
+    last_words = set(last_topic.lower().split())
+    
+    # If less than 20% word overlap, consider it a topic change
+    if len(current_words & last_words) / max(len(current_words), 1) < 0.2:
+        return True
+    
+    return False
+
+@cl.on_message
+async def main(message: cl.Message):
+    user_message = message.content
+    
+    # Get session state
+    memory = cl.user_session.get("conversation_memory", [])
+    last_topic = cl.user_session.get("last_topic")
+    message_count = cl.user_session.get("message_count", 0)
+    
+    # Determine if we should reset context
+    should_reset = (
+        message_count == 0 or  # First message
+        detect_topic_change(user_message, last_topic) or
+        len(memory) > 10  # Reset after too many exchanges
+    )
+    
+    if should_reset:
+        memory = []
+        await cl.Message(content="🆕 New conversation started").send()
+    
+    # Add to memory
+    memory.append({"role": "user", "content": user_message})
+    
+    # Generate response
+    response = generate_response_with_context(user_message, memory)
+    memory.append({"role": "assistant", "content": response})
+    
+    # Update session state
+    cl.user_session.set("conversation_memory", memory)
+    cl.user_session.set("last_topic", user_message)
+    cl.user_session.set("message_count", message_count + 1)
+    
+    await cl.Message(content=response).send()
+```
+
+## Method 3: Explicit User Intent Detection
+
+```python
+import re
+import chainlit as cl
+
+def analyze_user_intent(message: str, has_context: bool) -> dict:
+    """Analyze user message to determine intent and context needs"""
+    
+    message_lower = message.lower().strip()
+    
+    # Explicit reset triggers
+    reset_triggers = [
+        'new topic', 'change subject', 'start over', 'reset',
+        'different question', 'something else', 'new question'
+    ]
+    
+    # Follow-up indicators
+    followup_indicators = [
+        'also', 'and', 'but', 'however', 'what about',
+        'can you also', 'tell me more', 'explain',
+        'elaborate on', 'continue', 'more details'
+    ]
+    
+    # Question starters that usually indicate new topics
+    new_topic_starters = [
+        'how do i', 'what is', 'can you help', 'i need to',
+        'i want to', 'how can i', 'what are', 'tell me about'
+    ]
+    
+    intent = {
+        'is_followup': False,
+        'is_new_topic': False,
+        'confidence': 0.0
+    }
+    
+    # Check for explicit reset
+    if any(trigger in message_lower for trigger in reset_triggers):
+        intent['is_new_topic'] = True
+        intent['confidence'] = 0.9
+        return intent
+    
+    # Check for follow-up indicators
+    if any(indicator in message_lower for indicator in followup_indicators):
+        intent['is_followup'] = True
+        intent['confidence'] = 0.8
+        return intent
+    
+    # Check for new topic starters
+    if any(message_lower.startswith(starter) for starter in new_topic_starters):
+        intent['is_new_topic'] = True
+        intent['confidence'] = 0.7
+        return intent
+    
+    # If no context exists, treat as new topic
+    if not has_context:
+        intent['is_new_topic'] = True
+        intent['confidence'] = 1.0
+        return intent
+    
+    # Default: assume follow-up if context exists
+    intent['is_followup'] = has_context
+    intent['confidence'] = 0.5
+    
+    return intent
+
+@cl.on_message
+async def main(message: cl.Message):
+    user_message = message.content
+    
+    # Get current memory
+    memory = cl.user_session.get("conversation_memory", [])
+    
+    # Analyze intent
+    intent = analyze_user_intent(user_message, len(memory) > 0)
+    
+    # Decision logic
+    if intent['is_new_topic'] or (not intent['is_followup'] and intent['confidence'] > 0.6):
+        # Reset memory
+        memory = []
+        context_msg = f"🔄 New conversation (confidence: {intent['confidence']:.1f})"
+        await cl.Message(content=context_msg).send()
+    
+    # Process with appropriate context
+    memory.append({"role": "user", "content": user_message})
+    
+    # Your response generation logic here
+    response = f"Processing with {'existing' if len(memory) > 1 else 'new'} context..."
+    
+    memory.append({"role": "assistant", "content": response})
+    cl.user_session.set("conversation_memory", memory)
+    
+    await cl.Message(content=response).send()
+```
+
+## Method 4: Simple Time + Content Based Approach
+
+```python
+import chainlit as cl
+from datetime import datetime, timedelta
+
+@cl.on_chat_start
+async def start():
+    cl.user_session.set("last_message_time", None)
+    cl.user_session.set("conversation_memory", [])
+
+@cl.on_message
+async def main(message: cl.Message):
+    current_time = datetime.now()
+    last_time = cl.user_session.get("last_message_time")
+    memory = cl.user_session.get("conversation_memory", [])
+    
+    # Reset conditions
+    should_reset = (
+        last_time is None or  # First message
+        (current_time - last_time) > timedelta(minutes=5) or  # Long gap
+        len(message.content.split()) > 20  # Long message (likely new topic)
+    )
+    
+    if should_reset:
+        memory = []
+        if last_time is not None:
+            await cl.Message(content="⏰ Context reset due to time gap or new topic").send()
+    
+    # Continue with your logic...
+    memory.append({"role": "user", "content": message.content})
+    
+    # Update session
+    cl.user_session.set("last_message_time", current_time)
+    cl.user_session.set("conversation_memory", memory)
+    
+    # Generate and send response
+    response = generate_response(message.content, memory)
+    await cl.Message(content=response).send()
+```
+
+Choose the method that best fits your application's needs. Method 1 provides the most sophisticated detection, while Method 4 is simpler and more reliable for basic use cases.
