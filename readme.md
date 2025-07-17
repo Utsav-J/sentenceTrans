@@ -1,440 +1,3 @@
-Here are the code modifications to provide a real-time feel configuration:
-
-## 1. Updated React App with Real-time Config
-
-```jsx
-import React, { useState, useEffect, useRef } from 'react';
-import './App.css';
-import { FaMicrophone, FaGithub, FaSun, FaMoon, FaStop } from 'react-icons/fa';
-
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-const DEFINITIONS_CACHE_KEY = 'wf_teams_definitions_cache';
-
-// Real-time configuration
-const REALTIME_CONFIG = {
-  CLIENT_POLLING_INTERVAL: parseInt(process.env.REACT_APP_CLIENT_POLLING_INTERVAL) || 1000, // 1 second
-  LLM_SEND_INTERVAL: parseInt(process.env.REACT_APP_LLM_SEND_INTERVAL) || 2000, // 2 seconds
-  TRANSCRIPTION_WINDOW: parseInt(process.env.REACT_APP_TRANSCRIPTION_WINDOW) || 8000, // 8 seconds
-  ACTIVITY_BOOST_MULTIPLIER: parseFloat(process.env.REACT_APP_ACTIVITY_BOOST) || 0.5, // 50% faster when active
-  QUIET_PERIOD_THRESHOLD: parseInt(process.env.REACT_APP_QUIET_THRESHOLD) || 3000, // 3 seconds of quiet
-};
-
-function App() {
-  const [isRecording, setIsRecording] = useState(false);
-  const [transcription, setTranscription] = useState('');
-  const [interimTranscription, setInterimTranscription] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [darkMode, setDarkMode] = useState(false);
-  const [hasTranscribed, setHasTranscribed] = useState(false);
-  const [definitions, setDefinitions] = useState([]);
-  const [isSupported, setIsSupported] = useState(false);
-  const [lastActivityTime, setLastActivityTime] = useState(0);
-  
-  const recognitionRef = useRef(null);
-  const pollingTimeoutRef = useRef(null);
-  const transcriptionBuffer = useRef([]);
-  const lastSentTime = useRef(0);
-  const isActiveRef = useRef(false);
-
-  // Dynamic interval calculation based on activity
-  const getPollingInterval = () => {
-    const now = Date.now();
-    const timeSinceLastActivity = now - lastActivityTime;
-    const isQuiet = timeSinceLastActivity > REALTIME_CONFIG.QUIET_PERIOD_THRESHOLD;
-    
-    if (isQuiet) {
-      return REALTIME_CONFIG.CLIENT_POLLING_INTERVAL * 2; // Slower when quiet
-    } else {
-      return REALTIME_CONFIG.CLIENT_POLLING_INTERVAL * REALTIME_CONFIG.ACTIVITY_BOOST_MULTIPLIER; // Faster when active
-    }
-  };
-
-  // Initialize Speech Recognition
-  useEffect(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    
-    if (SpeechRecognition) {
-      setIsSupported(true);
-      
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-      
-      recognition.onresult = (event) => {
-        let finalTranscript = '';
-        let interimTranscript = '';
-        const now = Date.now();
-
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript;
-          } else {
-            interimTranscript += transcript;
-          }
-        }
-
-        // Update activity time on any speech input
-        if (finalTranscript || interimTranscript) {
-          setLastActivityTime(now);
-          isActiveRef.current = true;
-        }
-
-        if (finalTranscript) {
-          setTranscription(prev => {
-            const newTranscription = prev + finalTranscript;
-            transcriptionBuffer.current.push({
-              timestamp: new Date(),
-              text: finalTranscript
-            });
-            return newTranscription;
-          });
-          setHasTranscribed(true);
-        }
-        
-        setInterimTranscription(interimTranscript);
-      };
-
-      recognition.onstart = () => {
-        setIsRecording(true);
-        setLoading(false);
-        setLastActivityTime(Date.now());
-      };
-
-      recognition.onend = () => {
-        setIsRecording(false);
-        setInterimTranscription('');
-        isActiveRef.current = false;
-      };
-
-      recognition.onerror = (event) => {
-        console.error('Speech recognition error:', event.error);
-        setIsRecording(false);
-        setLoading(false);
-        isActiveRef.current = false;
-        if (event.error === 'not-allowed') {
-          alert('Microphone access denied. Please allow microphone access and try again.');
-        }
-      };
-
-      recognitionRef.current = recognition;
-    }
-
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-    };
-  }, [lastActivityTime]);
-
-  // Load cached definitions on mount
-  useEffect(() => {
-    const cached = localStorage.getItem(DEFINITIONS_CACHE_KEY);
-    if (cached) {
-      try {
-        setDefinitions(JSON.parse(cached));
-      } catch {
-        setDefinitions([]);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    document.body.setAttribute('data-theme', darkMode ? 'dark' : 'light');
-  }, [darkMode]);
-
-  // Adaptive polling with dynamic intervals
-  useEffect(() => {
-    if (isRecording) {
-      const schedulePoll = () => {
-        pollingTimeoutRef.current = setTimeout(async () => {
-          // Send recent transcription to server for LLM processing
-          const now = Date.now();
-          const recentTranscription = getRecentTranscription(REALTIME_CONFIG.TRANSCRIPTION_WINDOW);
-          
-          if (recentTranscription && now - lastSentTime.current > REALTIME_CONFIG.LLM_SEND_INTERVAL) {
-            try {
-              await fetch(`${API_URL}/process-transcription`, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ 
-                  text: recentTranscription,
-                  timestamp: now,
-                  is_active: isActiveRef.current
-                })
-              });
-              lastSentTime.current = now;
-            } catch (err) {
-              console.error('Error sending transcription:', err);
-            }
-          }
-
-          // Get latest LLM output
-          try {
-            const res = await fetch(`${API_URL}/llm/latest`);
-            if (res.ok) {
-              const llmData = await res.json();
-              if (llmData.llm_output && llmData.llm_output.technical_terms) {
-                setDefinitions(prevDefs => {
-                  const prevTerms = new Set(prevDefs.map(d => d.term));
-                  const newDefs = llmData.llm_output.technical_terms.filter(d => d.term && !prevTerms.has(d.term));
-                  const merged = [...prevDefs, ...newDefs];
-                  localStorage.setItem(DEFINITIONS_CACHE_KEY, JSON.stringify(merged));
-                  return merged;
-                });
-              }
-            }
-          } catch (err) {
-            console.error('Error fetching LLM output:', err);
-          }
-
-          // Schedule next poll with dynamic interval
-          if (isRecording) {
-            schedulePoll();
-          }
-        }, getPollingInterval());
-      };
-
-      schedulePoll();
-    } else {
-      clearTimeout(pollingTimeoutRef.current);
-    }
-
-    return () => clearTimeout(pollingTimeoutRef.current);
-  }, [isRecording, lastActivityTime]);
-
-  const getRecentTranscription = (milliseconds) => {
-    const cutoff = new Date(Date.now() - milliseconds);
-    return transcriptionBuffer.current
-      .filter(item => item.timestamp >= cutoff)
-      .map(item => item.text)
-      .join(' ');
-  };
-
-  const handleStart = async () => {
-    if (!isSupported) {
-      alert('Speech recognition is not supported in this browser. Please use Chrome, Edge, or Safari.');
-      return;
-    }
-
-    setTranscription('');
-    setInterimTranscription('');
-    setLoading(true);
-    setHasTranscribed(false);
-    transcriptionBuffer.current = [];
-    lastSentTime.current = 0;
-    setLastActivityTime(Date.now());
-    isActiveRef.current = false;
-
-    try {
-      // Start session on server with real-time config
-      const res = await fetch(`${API_URL}/session/start`, { 
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          config: {
-            llm_interval: Math.floor(REALTIME_CONFIG.LLM_SEND_INTERVAL / 1000), // Convert to seconds
-            transcription_window: Math.floor(REALTIME_CONFIG.TRANSCRIPTION_WINDOW / 1000),
-            realtime_mode: true
-          }
-        })
-      });
-      
-      if (res.ok) {
-        recognitionRef.current.start();
-      } else {
-        setLoading(false);
-        alert('Failed to start session on server.');
-      }
-    } catch (err) {
-      setLoading(false);
-      alert('Could not start session: ' + err.message);
-    }
-  };
-
-  const handleStop = async () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
-    
-    clearTimeout(pollingTimeoutRef.current);
-    setLoading(true);
-    isActiveRef.current = false;
-    
-    try {
-      const res = await fetch(`${API_URL}/session/stop`, { method: 'POST' });
-      setLoading(false);
-      if (!res.ok) {
-        alert('Failed to stop session on server.');
-      }
-    } catch (err) {
-      setLoading(false);
-      alert('Could not stop session: ' + err.message);
-    }
-  };
-
-  const handleClear = () => {
-    setDefinitions([]);
-    localStorage.removeItem(DEFINITIONS_CACHE_KEY);
-    setTranscription('');
-    setInterimTranscription('');
-    setHasTranscribed(false);
-    transcriptionBuffer.current = [];
-    setLastActivityTime(0);
-    isActiveRef.current = false;
-  };
-
-  const DefinitionCard = ({ term, definition }) => (
-    <div className="card definition-card">
-      <div className="card-term">{term || <i>Unknown term</i>}</div>
-      <div className="card-definition">{definition || <i>No definition</i>}</div>
-    </div>
-  );
-
-  const ContextCard = ({ term, contextual_explanation, example_quote }) => (
-    <div className="card context-card">
-      <div className="card-term">{term || <i>Unknown term</i>}</div>
-      <div className="card-context">{contextual_explanation || <i>No context</i>}</div>
-      {example_quote && <div className="card-example"><b>Example:</b> "{example_quote}"</div>}
-    </div>
-  );
-
-  const renderDefinitions = () => {
-    if (!definitions || definitions.length === 0) {
-      return <div>No technical terms found yet.</div>;
-    }
-    return (
-      <div className="card-list">
-        {definitions.map((def, idx) => (
-          <DefinitionCard key={idx} term={def.term} definition={def.definition} />
-        ))}
-      </div>
-    );
-  };
-
-  const renderContext = () => {
-    if (!definitions || definitions.length === 0) {
-      return <div>No contextual explanations yet.</div>;
-    }
-    return (
-      <div className="card-list">
-        {definitions.map((def, idx) => (
-          <ContextCard key={idx} term={def.term} contextual_explanation={def.contextual_explanation} example_quote={def.example_quote} />
-        ))}
-      </div>
-    );
-  };
-
-  if (!isSupported) {
-    return (
-      <div className={`app-root ${darkMode ? 'dark' : 'light'}`}>
-        <div style={{ padding: '20px', textAlign: 'center' }}>
-          <h2>Browser Not Supported</h2>
-          <p>Web Speech API is not supported in this browser.</p>
-          <p>Please use Chrome, Edge, or Safari for speech recognition.</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className={`app-root ${darkMode ? 'dark' : 'light'}`}>
-      <header className="app-header glass">
-        <div className="header-title">Meeting Insights</div>
-        <div className="header-subtitle">
-          Real-time Mode • {getPollingInterval()}ms polling
-        </div>
-        <div className="header-actions">
-          <button className="icon-btn" title="GitHub Repo">
-            <FaGithub />
-          </button>
-          <button className="theme-toggle-pill" onClick={() => setDarkMode(dm => !dm)}>
-            {darkMode ? <FaSun /> : <FaMoon />}
-          </button>
-        </div>
-      </header>
-      
-      <div className="main-columns">
-        <div className="column transcript-column glass">
-          <div className="transcript-header">
-            <button
-              className={`record-btn${isRecording ? ' recording' : ''}`}
-              onClick={isRecording ? handleStop : handleStart}
-              disabled={loading}
-            >
-              {isRecording ? <><FaStop /> Stop</> : <><FaMicrophone /> Record</>}
-            </button>
-            <span className="status-text">
-              {isRecording ? 
-                `Recording... ${isActiveRef.current ? '🎤' : '⏸️'}` : 
-                loading ? 'Processing...' : 'Ready'
-              }
-            </span>
-            <button
-              className="clear-session-btn"
-              onClick={handleClear}
-              title="Clear all definitions, explanations, and transcript"
-            >
-              Clear Session
-            </button>
-          </div>
-          <div className="transcription-box glass">
-            <div className="transcription-content">
-              {!hasTranscribed && (
-                <div className="greeting"></div>
-              )}
-              <div className="mic-visualizer">
-                {isRecording ? (
-                  <div className="mic-anim">
-                    <FaMicrophone className={`mic-icon recording ${isActiveRef.current ? 'active' : 'listening'}`} />
-                  </div>
-                ) : (
-                  <FaMicrophone className="mic-icon idle" />
-                )}
-              </div>
-              <div className="transcription-text fade-in">
-                {loading ? (
-                  <span>Starting real-time mode...</span>
-                ) : (
-                  <span>
-                    {transcription || 'Hi there! Start speaking to transcribe your voice note.'}
-                    <span style={{ color: '#999', fontStyle: 'italic' }}>{interimTranscription}</span>
-                  </span>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <div className="column definitions-column glass">
-          <div className="column-title">Technical Definitions</div>
-          <div className="definitions-box card-scroll">
-            {renderDefinitions()}
-          </div>
-        </div>
-        
-        <div className="column context-column glass">
-          <div className="column-title">Contextual Explanations & Examples</div>
-          <div className="context-box card-scroll">
-            {renderContext()}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export default App;
-```
-
-## 2. Updated FastAPI Server with Real-time Config
-
-```python
 import os
 import threading
 import time
@@ -579,4 +142,135 @@ def get_gemini_definitions(text):
             print(f"[LLM JSON ERROR] {e}\nRaw output: {json_str}")
             return None
     else:
-        print(f"[LLM NO JSON FOUND] Raw output: {response.te
+        print(f"[LLM NO JSON FOUND] Raw output: {response.text}")
+        return None
+
+# Adaptive LLM processor
+class AdaptiveLLMWorker(threading.Thread):
+    def __init__(self, shared_state):
+        super().__init__(daemon=True)
+        self.shared_state = shared_state
+        self.running = llm_running
+
+    def run(self):
+        while self.running.is_set():
+            # Get dynamic interval based on activity
+            interval = self.shared_state.get_dynamic_interval()
+            
+            print(f"[LLM] Sleeping for {interval}s (activity: {self.shared_state.activity_level:.2f})")
+            time.sleep(interval)
+            
+            recent_text = self.shared_state.get_last_n_seconds()
+            if recent_text.strip():
+                print(f"[LLM] Processing: {recent_text[:100]}...")
+                definitions = get_gemini_definitions(recent_text)
+                if definitions:
+                    obj = {
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "transcript": recent_text,
+                        "llm_output": definitions,
+                        "activity_level": self.shared_state.activity_level,
+                        "interval_used": interval
+                    }
+                    with open(LLM_OUTPUT_FILE, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(obj) + '\n')
+                    self.shared_state.set_llm_output(obj)
+
+# API Models
+class StatusResponse(BaseModel):
+    running: bool
+    config: Optional[Dict[str, Any]] = None
+    activity_level: Optional[float] = None
+
+class TranscriptionRequest(BaseModel):
+    text: str
+    timestamp: Optional[int] = None
+    is_active: Optional[bool] = False
+
+class SessionConfig(BaseModel):
+    config: Optional[Dict[str, Any]] = None
+
+@app.post("/session/start", response_model=StatusResponse)
+def start_session(session_config: Optional[SessionConfig] = None):
+    global llm_thread
+    
+    if llm_running.is_set():
+        return {
+            "running": True, 
+            "config": shared_state.config,
+            "activity_level": shared_state.activity_level
+        }
+    
+    # Update config if provided
+    if session_config and session_config.config:
+        shared_state.update_config(session_config.config)
+        print(f"[SESSION] Updated config: {session_config.config}")
+    
+    llm_running.set()
+    shared_state.transcription_buffer.clear()
+    shared_state.llm_output = None
+    shared_state.activity_level = 0
+    
+    llm_thread = AdaptiveLLMWorker(shared_state)
+    llm_thread.start()
+    
+    return {
+        "running": True,
+        "config": shared_state.config,
+        "activity_level": shared_state.activity_level
+    }
+
+@app.post("/session/stop", response_model=StatusResponse)
+def stop_session():
+    llm_running.clear()
+    return {
+        "running": False,
+        "config": shared_state.config,
+        "activity_level": shared_state.activity_level
+    }
+
+@app.post("/process-transcription")
+def process_transcription(request: TranscriptionRequest):
+    """Receive transcription from client and add to buffer for LLM processing"""
+    shared_state.add_transcription(request.text, request.is_active)
+    return {
+        "status": "received",
+        "activity_level": shared_state.activity_level,
+        "next_interval": shared_state.get_dynamic_interval()
+    }
+
+@app.get("/llm/latest")
+def get_latest_llm():
+    output = shared_state.get_llm_output()
+    if output is None:
+        raise HTTPException(status_code=404, detail="No LLM output yet.")
+    return output
+
+@app.get("/session/status")
+def get_session_status():
+    return {
+        "running": llm_running.is_set(),
+        "config": shared_state.config,
+        "activity_level": shared_state.activity_level,
+        "buffer_size": len(shared_state.transcription_buffer),
+        "next_interval": shared_state.get_dynamic_interval()
+    }
+
+# Health check
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "mode": "realtime"}3. Environment Variables (.env file)# Real-time configuration
+REACT_APP_CLIENT_POLLING_INTERVAL=1000
+REACT_APP_LLM_SEND_INTERVAL=2000
+REACT_APP_TRANSCRIPTION_WINDOW=8000
+REACT_APP_ACTIVITY_BOOST=0.5
+REACT_APP_QUIET_THRESHOLD=3000
+
+# Server configuration
+LLM_INTERVAL=2
+TRANSCRIPTION_WINDOW=8
+ACTIVITY_BOOST=0.5
+QUIET_THRESHOLD=5
+
+# API Keys
+GOOGLE_API_KEY=your_gemini_api_key_hereKey Real-time Features:Dynamic Polling: 500ms-2000ms based on speech activityActivity Detection: Tracks when user is actively speakingAdaptive LLM Processing: 1-4 second intervals based on activitySmart Buffering: Longer transcription windows when activeVisual Feedback: Shows real-time status and activity indicatorsConfigurable: All intervals adjustable via environment variablesPerformance Optimizations:50% faster polling when actively speaking2x slower processing during quiet periodsSmart windowing keeps more context when activeActivity decay gradually reduces processing frequencyStatus indicators show current polling rateThis gives you a truly responsive real-time experience while being efficient with API calls!
