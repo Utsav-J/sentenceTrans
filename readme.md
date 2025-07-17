@@ -1,6 +1,6 @@
-Perfect! I can see your current implementation uses server-side Whisper transcription with FastAPI. Let me help you convert this to client-side Web Speech API transcription while keeping the LLM processing on the server.
+Here are the code modifications to provide a real-time feel configuration:
 
-Here's your updated React app with client-side speech recognition:
+## 1. Updated React App with Real-time Config
 
 ```jsx
 import React, { useState, useEffect, useRef } from 'react';
@@ -9,6 +9,15 @@ import { FaMicrophone, FaGithub, FaSun, FaMoon, FaStop } from 'react-icons/fa';
 
 const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 const DEFINITIONS_CACHE_KEY = 'wf_teams_definitions_cache';
+
+// Real-time configuration
+const REALTIME_CONFIG = {
+  CLIENT_POLLING_INTERVAL: parseInt(process.env.REACT_APP_CLIENT_POLLING_INTERVAL) || 1000, // 1 second
+  LLM_SEND_INTERVAL: parseInt(process.env.REACT_APP_LLM_SEND_INTERVAL) || 2000, // 2 seconds
+  TRANSCRIPTION_WINDOW: parseInt(process.env.REACT_APP_TRANSCRIPTION_WINDOW) || 8000, // 8 seconds
+  ACTIVITY_BOOST_MULTIPLIER: parseFloat(process.env.REACT_APP_ACTIVITY_BOOST) || 0.5, // 50% faster when active
+  QUIET_PERIOD_THRESHOLD: parseInt(process.env.REACT_APP_QUIET_THRESHOLD) || 3000, // 3 seconds of quiet
+};
 
 function App() {
   const [isRecording, setIsRecording] = useState(false);
@@ -19,11 +28,26 @@ function App() {
   const [hasTranscribed, setHasTranscribed] = useState(false);
   const [definitions, setDefinitions] = useState([]);
   const [isSupported, setIsSupported] = useState(false);
+  const [lastActivityTime, setLastActivityTime] = useState(0);
   
   const recognitionRef = useRef(null);
-  const pollingRef = useRef(null);
+  const pollingTimeoutRef = useRef(null);
   const transcriptionBuffer = useRef([]);
   const lastSentTime = useRef(0);
+  const isActiveRef = useRef(false);
+
+  // Dynamic interval calculation based on activity
+  const getPollingInterval = () => {
+    const now = Date.now();
+    const timeSinceLastActivity = now - lastActivityTime;
+    const isQuiet = timeSinceLastActivity > REALTIME_CONFIG.QUIET_PERIOD_THRESHOLD;
+    
+    if (isQuiet) {
+      return REALTIME_CONFIG.CLIENT_POLLING_INTERVAL * 2; // Slower when quiet
+    } else {
+      return REALTIME_CONFIG.CLIENT_POLLING_INTERVAL * REALTIME_CONFIG.ACTIVITY_BOOST_MULTIPLIER; // Faster when active
+    }
+  };
 
   // Initialize Speech Recognition
   useEffect(() => {
@@ -40,6 +64,7 @@ function App() {
       recognition.onresult = (event) => {
         let finalTranscript = '';
         let interimTranscript = '';
+        const now = Date.now();
 
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const transcript = event.results[i][0].transcript;
@@ -48,6 +73,12 @@ function App() {
           } else {
             interimTranscript += transcript;
           }
+        }
+
+        // Update activity time on any speech input
+        if (finalTranscript || interimTranscript) {
+          setLastActivityTime(now);
+          isActiveRef.current = true;
         }
 
         if (finalTranscript) {
@@ -68,17 +99,20 @@ function App() {
       recognition.onstart = () => {
         setIsRecording(true);
         setLoading(false);
+        setLastActivityTime(Date.now());
       };
 
       recognition.onend = () => {
         setIsRecording(false);
         setInterimTranscription('');
+        isActiveRef.current = false;
       };
 
       recognition.onerror = (event) => {
         console.error('Speech recognition error:', event.error);
         setIsRecording(false);
         setLoading(false);
+        isActiveRef.current = false;
         if (event.error === 'not-allowed') {
           alert('Microphone access denied. Please allow microphone access and try again.');
         }
@@ -92,7 +126,7 @@ function App() {
         recognitionRef.current.stop();
       }
     };
-  }, []);
+  }, [lastActivityTime]);
 
   // Load cached definitions on mount
   useEffect(() => {
@@ -110,54 +144,67 @@ function App() {
     document.body.setAttribute('data-theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
 
-  // Send transcription to server and poll for LLM output
+  // Adaptive polling with dynamic intervals
   useEffect(() => {
     if (isRecording) {
-      pollingRef.current = setInterval(async () => {
-        // Send recent transcription to server for LLM processing
-        const now = Date.now();
-        const recentTranscription = getRecentTranscription(5000); // Last 5 seconds
-        
-        if (recentTranscription && now - lastSentTime.current > 3000) {
-          try {
-            await fetch(`${API_URL}/process-transcription`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({ text: recentTranscription })
-            });
-            lastSentTime.current = now;
-          } catch (err) {
-            console.error('Error sending transcription:', err);
-          }
-        }
-
-        // Get latest LLM output
-        try {
-          const res = await fetch(`${API_URL}/llm/latest`);
-          if (res.ok) {
-            const llmData = await res.json();
-            if (llmData.llm_output && llmData.llm_output.technical_terms) {
-              setDefinitions(prevDefs => {
-                const prevTerms = new Set(prevDefs.map(d => d.term));
-                const newDefs = llmData.llm_output.technical_terms.filter(d => d.term && !prevTerms.has(d.term));
-                const merged = [...prevDefs, ...newDefs];
-                localStorage.setItem(DEFINITIONS_CACHE_KEY, JSON.stringify(merged));
-                return merged;
+      const schedulePoll = () => {
+        pollingTimeoutRef.current = setTimeout(async () => {
+          // Send recent transcription to server for LLM processing
+          const now = Date.now();
+          const recentTranscription = getRecentTranscription(REALTIME_CONFIG.TRANSCRIPTION_WINDOW);
+          
+          if (recentTranscription && now - lastSentTime.current > REALTIME_CONFIG.LLM_SEND_INTERVAL) {
+            try {
+              await fetch(`${API_URL}/process-transcription`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ 
+                  text: recentTranscription,
+                  timestamp: now,
+                  is_active: isActiveRef.current
+                })
               });
+              lastSentTime.current = now;
+            } catch (err) {
+              console.error('Error sending transcription:', err);
             }
           }
-        } catch (err) {
-          console.error('Error fetching LLM output:', err);
-        }
-      }, 3000);
+
+          // Get latest LLM output
+          try {
+            const res = await fetch(`${API_URL}/llm/latest`);
+            if (res.ok) {
+              const llmData = await res.json();
+              if (llmData.llm_output && llmData.llm_output.technical_terms) {
+                setDefinitions(prevDefs => {
+                  const prevTerms = new Set(prevDefs.map(d => d.term));
+                  const newDefs = llmData.llm_output.technical_terms.filter(d => d.term && !prevTerms.has(d.term));
+                  const merged = [...prevDefs, ...newDefs];
+                  localStorage.setItem(DEFINITIONS_CACHE_KEY, JSON.stringify(merged));
+                  return merged;
+                });
+              }
+            }
+          } catch (err) {
+            console.error('Error fetching LLM output:', err);
+          }
+
+          // Schedule next poll with dynamic interval
+          if (isRecording) {
+            schedulePoll();
+          }
+        }, getPollingInterval());
+      };
+
+      schedulePoll();
     } else {
-      clearInterval(pollingRef.current);
+      clearTimeout(pollingTimeoutRef.current);
     }
 
-    return () => clearInterval(pollingRef.current);
-  }, [isRecording]);
+    return () => clearTimeout(pollingTimeoutRef.current);
+  }, [isRecording, lastActivityTime]);
 
   const getRecentTranscription = (milliseconds) => {
     const cutoff = new Date(Date.now() - milliseconds);
@@ -179,10 +226,25 @@ function App() {
     setHasTranscribed(false);
     transcriptionBuffer.current = [];
     lastSentTime.current = 0;
+    setLastActivityTime(Date.now());
+    isActiveRef.current = false;
 
     try {
-      // Start session on server
-      const res = await fetch(`${API_URL}/session/start`, { method: 'POST' });
+      // Start session on server with real-time config
+      const res = await fetch(`${API_URL}/session/start`, { 
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          config: {
+            llm_interval: Math.floor(REALTIME_CONFIG.LLM_SEND_INTERVAL / 1000), // Convert to seconds
+            transcription_window: Math.floor(REALTIME_CONFIG.TRANSCRIPTION_WINDOW / 1000),
+            realtime_mode: true
+          }
+        })
+      });
+      
       if (res.ok) {
         recognitionRef.current.start();
       } else {
@@ -200,7 +262,10 @@ function App() {
       recognitionRef.current.stop();
     }
     
+    clearTimeout(pollingTimeoutRef.current);
     setLoading(true);
+    isActiveRef.current = false;
+    
     try {
       const res = await fetch(`${API_URL}/session/stop`, { method: 'POST' });
       setLoading(false);
@@ -220,6 +285,8 @@ function App() {
     setInterimTranscription('');
     setHasTranscribed(false);
     transcriptionBuffer.current = [];
+    setLastActivityTime(0);
+    isActiveRef.current = false;
   };
 
   const DefinitionCard = ({ term, definition }) => (
@@ -279,6 +346,9 @@ function App() {
     <div className={`app-root ${darkMode ? 'dark' : 'light'}`}>
       <header className="app-header glass">
         <div className="header-title">Meeting Insights</div>
+        <div className="header-subtitle">
+          Real-time Mode • {getPollingInterval()}ms polling
+        </div>
         <div className="header-actions">
           <button className="icon-btn" title="GitHub Repo">
             <FaGithub />
@@ -300,7 +370,10 @@ function App() {
               {isRecording ? <><FaStop /> Stop</> : <><FaMicrophone /> Record</>}
             </button>
             <span className="status-text">
-              {isRecording ? 'Recording...' : loading ? 'Processing...' : 'Ready'}
+              {isRecording ? 
+                `Recording... ${isActiveRef.current ? '🎤' : '⏸️'}` : 
+                loading ? 'Processing...' : 'Ready'
+              }
             </span>
             <button
               className="clear-session-btn"
@@ -318,7 +391,7 @@ function App() {
               <div className="mic-visualizer">
                 {isRecording ? (
                   <div className="mic-anim">
-                    <FaMicrophone className="mic-icon recording" />
+                    <FaMicrophone className={`mic-icon recording ${isActiveRef.current ? 'active' : 'listening'}`} />
                   </div>
                 ) : (
                   <FaMicrophone className="mic-icon idle" />
@@ -326,11 +399,11 @@ function App() {
               </div>
               <div className="transcription-text fade-in">
                 {loading ? (
-                  <span>Starting...</span>
+                  <span>Starting real-time mode...</span>
                 ) : (
                   <span>
                     {transcription || 'Hi there! Start speaking to transcribe your voice note.'}
-                    <span style={{ color: '#999' }}>{interimTranscription}</span>
+                    <span style={{ color: '#999', fontStyle: 'italic' }}>{interimTranscription}</span>
                   </span>
                 )}
               </div>
@@ -359,7 +432,7 @@ function App() {
 export default App;
 ```
 
-And here's your updated FastAPI server (simplified since transcription is now client-side):
+## 2. Updated FastAPI Server with Real-time Config
 
 ```python
 import os
@@ -373,11 +446,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 from dotenv import load_dotenv
+from typing import Optional, Dict, Any
 
 # Load environment variables
 load_dotenv()
 GEMINI_API_KEY = os.getenv('GOOGLE_API_KEY')
 LLM_OUTPUT_FILE = "llm_definitions.jsonl"
+
+# Real-time configuration
+REALTIME_CONFIG = {
+    'LLM_INTERVAL': int(os.getenv('LLM_INTERVAL', '2')),  # 2 seconds for real-time
+    'TRANSCRIPTION_WINDOW': int(os.getenv('TRANSCRIPTION_WINDOW', '8')),  # 8 seconds
+    'ACTIVITY_BOOST': float(os.getenv('ACTIVITY_BOOST', '0.5')),  # 50% faster when active
+    'QUIET_THRESHOLD': int(os.getenv('QUIET_THRESHOLD', '5')),  # 5 seconds quiet threshold
+}
 
 # FastAPI app
 app = FastAPI()
@@ -395,24 +477,53 @@ genai.configure(api_key=GEMINI_API_KEY)
 llm_thread = None
 llm_running = threading.Event()
 
-# Shared data
+# Shared data with activity tracking
 class SharedState:
     def __init__(self):
-        self.transcription_buffer = []  # list of (timestamp, text)
+        self.transcription_buffer = []  # list of (timestamp, text, is_active)
         self.llm_output = None
         self.lock = threading.Lock()
+        self.last_activity = datetime.utcnow()
+        self.activity_level = 0  # 0-1 scale
+        self.config = REALTIME_CONFIG.copy()
 
-    def add_transcription(self, text):
+    def add_transcription(self, text, is_active=False):
         with self.lock:
-            self.transcription_buffer.append((datetime.utcnow(), text))
-            # Keep only last 30 seconds
-            cutoff = datetime.utcnow() - timedelta(seconds=30)
+            now = datetime.utcnow()
+            self.transcription_buffer.append((now, text, is_active))
+            
+            if is_active:
+                self.last_activity = now
+                self.activity_level = min(1.0, self.activity_level + 0.2)
+            else:
+                # Decay activity level
+                time_since_activity = (now - self.last_activity).total_seconds()
+                if time_since_activity > self.config['QUIET_THRESHOLD']:
+                    self.activity_level = max(0.0, self.activity_level - 0.1)
+            
+            # Keep only last N seconds based on activity
+            window_size = self.config['TRANSCRIPTION_WINDOW']
+            if self.activity_level > 0.5:
+                window_size = int(window_size * 1.5)  # Longer window when active
+            
+            cutoff = now - timedelta(seconds=window_size)
             self.transcription_buffer = [x for x in self.transcription_buffer if x[0] >= cutoff]
 
-    def get_last_n_seconds(self, seconds=5):
+    def get_last_n_seconds(self, seconds=None):
         with self.lock:
+            if seconds is None:
+                seconds = self.config['TRANSCRIPTION_WINDOW']
+            
             cutoff = datetime.utcnow() - timedelta(seconds=seconds)
-            return ' '.join([t for ts, t in self.transcription_buffer if ts >= cutoff])
+            return ' '.join([t for ts, t, _ in self.transcription_buffer if ts >= cutoff])
+
+    def get_dynamic_interval(self):
+        with self.lock:
+            base_interval = self.config['LLM_INTERVAL']
+            if self.activity_level > 0.5:
+                return max(1, int(base_interval * self.config['ACTIVITY_BOOST']))
+            else:
+                return base_interval * 2  # Slower when quiet
 
     def set_llm_output(self, output):
         with self.lock:
@@ -421,6 +532,10 @@ class SharedState:
     def get_llm_output(self):
         with self.lock:
             return self.llm_output
+
+    def update_config(self, new_config):
+        with self.lock:
+            self.config.update(new_config)
 
 shared_state = SharedState()
 
@@ -464,105 +579,4 @@ def get_gemini_definitions(text):
             print(f"[LLM JSON ERROR] {e}\nRaw output: {json_str}")
             return None
     else:
-        print(f"[LLM NO JSON FOUND] Raw output: {response.text}")
-        return None
-
-# Background LLM processor
-class LLMWorker(threading.Thread):
-    def __init__(self, shared_state, interval=5):
-        super().__init__(daemon=True)
-        self.shared_state = shared_state
-        self.interval = interval
-        self.running = llm_running
-
-    def run(self):
-        while self.running.is_set():
-            time.sleep(self.interval)
-            recent_text = self.shared_state.get_last_n_seconds(self.interval)
-            if recent_text.strip():
-                definitions = get_gemini_definitions(recent_text)
-                if definitions:
-                    obj = {
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "transcript": recent_text,
-                        "llm_output": definitions
-                    }
-                    with open(LLM_OUTPUT_FILE, 'a', encoding='utf-8') as f:
-                        f.write(json.dumps(obj) + '\n')
-                    self.shared_state.set_llm_output(obj)
-
-# API Models
-class StatusResponse(BaseModel):
-    running: bool
-
-class TranscriptionRequest(BaseModel):
-    text: str
-
-@app.post("/session/start", response_model=StatusResponse)
-def start_session():
-    global llm_thread
-    if llm_running.is_set():
-        return {"running": True}
-    
-    llm_running.set()
-    shared_state.transcription_buffer.clear()
-    shared_state.llm_output = None
-    
-    llm_thread = LLMWorker(shared_state)
-    llm_thread.start()
-    
-    return {"running": True}
-
-@app.post("/session/stop", response_model=StatusResponse)
-def stop_session():
-    llm_running.clear()
-    return {"running": False}
-
-@app.post("/process-transcription")
-def process_transcription(request: TranscriptionRequest):
-    """Receive transcription from client and add to buffer for LLM processing"""
-    shared_state.add_transcription(request.text)
-    return {"status": "received"}
-
-@app.get("/llm/latest")
-def get_latest_llm():
-    output = shared_state.get_llm_output()
-    if output is None:
-        raise HTTPException(status_code=404, detail="No LLM output yet.")
-    return output
-
-# Health check
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
-```
-
-## Key Changes:
-
-### React App:
-1. **Removed server-side transcription calls** - No more `/transcription/start`, `/transcription/stop`, or `/transcription/live`
-2. **Added Web Speech API integration** - Client-side speech recognition with interim results
-3. **Added browser support detection** - Graceful fallback for unsupported browsers
-4. **New transcription buffer** - Tracks recent transcriptions to send to server
-5. **Added `/process-transcription` endpoint calls** - Sends recent speech to server for LLM processing
-
-### FastAPI Server:
-1. **Removed Whisper and speech_recognition dependencies** - No longer needed
-2. **Simplified to LLM processing only** - Just handles technical term extraction
-3. **New `/process-transcription` endpoint** - Receives text from client
-4. **Session management** - `/session/start` and `/session/stop` for LLM processing
-5. **Removed audio processing** - No more microphone handling
-
-## Benefits:
-- **Faster response times** - No audio upload/processing delays
-- **Better real-time experience** - Immediate transcription feedback
-- **Reduced server load** - No audio processing on server
-- **Better privacy** - Audio stays on client device
-- **Simpler deployment** - No need for audio libraries on server
-
-## Browser Requirements:
-- Chrome, Edge, Safari (best support)
-- HTTPS required for production
-- Microphone permissions needed
-
-The app will now transcribe speech locally using the Web Speech API while still sending the text to your server for technical term extraction using Gemini AI!
+        print(f"[LLM NO JSON FOUND] Raw output: {response.te
