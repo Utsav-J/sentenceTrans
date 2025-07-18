@@ -15,6 +15,7 @@ from typing import Optional, Dict, Any
 load_dotenv()
 GEMINI_API_KEY = os.getenv('GOOGLE_API_KEY')
 LLM_OUTPUT_FILE = "llm_definitions.jsonl"
+ACTION_ITEMS_FILE = "action_items.jsonl"
 
 # Real-time configuration
 REALTIME_CONFIG = {
@@ -45,6 +46,7 @@ class SharedState:
     def __init__(self):
         self.transcription_buffer = []  # list of (timestamp, text, is_active)
         self.llm_output = None
+        self.action_items = []  # Store recent action items
         self.lock = threading.Lock()
         self.last_activity = datetime.utcnow()
         self.activity_level = 0  # 0-1 scale
@@ -96,14 +98,25 @@ class SharedState:
         with self.lock:
             return self.llm_output
 
+    def add_action_item(self, action_item):
+        with self.lock:
+            self.action_items.append(action_item)
+            # Keep only last 50 action items
+            if len(self.action_items) > 50:
+                self.action_items = self.action_items[-50:]
+
+    def get_recent_action_items(self, limit=10):
+        with self.lock:
+            return self.action_items[-limit:]
+
     def update_config(self, new_config):
         with self.lock:
             self.config.update(new_config)
 
 shared_state = SharedState()
 
-# Gemini LLM call (same as before)
-SCHEMA = '''
+# Technical definitions schema (existing)
+TECHNICAL_DEFINITIONS_SCHEMA = '''
 {
   "type": "object",
   "properties": {
@@ -126,10 +139,62 @@ SCHEMA = '''
 }
 '''
 
+# Action items detection and generation schemas
+ACTION_DETECTION_SCHEMA = '''
+{
+  "type": "object",
+  "properties": {
+    "has_action_items": {
+      "type": "boolean",
+      "description": "Whether the transcript contains any action-oriented phrases that require note-taking or action items."
+    },
+    "action_triggers": {
+      "type": "array",
+      "description": "List of phrases or contexts that triggered action item detection.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "trigger_phrase": {"type": "string", "description": "The phrase that triggered action detection (e.g., 'note this down', 'create a form')."},
+          "context": {"type": "string", "description": "The surrounding context where the trigger appeared."},
+          "action_type": {"type": "string", "description": "Type of action needed (note, form, task, reminder, etc.)"}
+        },
+        "required": ["trigger_phrase", "context", "action_type"]
+      }
+    }
+  },
+  "required": ["has_action_items", "action_triggers"]
+}
+'''
+
+ACTION_GENERATION_SCHEMA = '''
+{
+  "type": "object",
+  "properties": {
+    "action_items": {
+      "type": "array",
+      "description": "Generated action items based on the transcript context.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string", "description": "A clear, concise title for the action item."},
+          "description": {"type": "string", "description": "Detailed description of what needs to be done."},
+          "type": {"type": "string", "description": "Type of action (note, form, task, reminder, follow-up, etc.)"},
+          "priority": {"type": "string", "description": "Priority level (high, medium, low)."},
+          "context": {"type": "string", "description": "The original context from the transcript that led to this action."},
+          "suggested_content": {"type": "string", "description": "If applicable, suggested content for the note/form/task."}
+        },
+        "required": ["title", "description", "type", "priority", "context"]
+      }
+    }
+  },
+  "required": ["action_items"]
+}
+'''
+
 def get_gemini_definitions(text):
     prompt = (
         "Extract all technical terms from the following text and provide their definitions and context. "
-        "Return the result as a JSON object matching this schema (if no terms, use an empty list for 'technical_terms'):\n" + SCHEMA + "\nText:\n" + text
+        "Return the result as a JSON object matching this schema (if no terms, use an empty list for 'technical_terms'):\n" + TECHNICAL_DEFINITIONS_SCHEMA + "\nText:\n" + text
     )
     model = genai.GenerativeModel('gemini-2.0-flash')
     response = model.generate_content(prompt)
@@ -139,14 +204,57 @@ def get_gemini_definitions(text):
         try:
             return json.loads(json_str)
         except Exception as e:
-            print(f"[LLM JSON ERROR] {e}\nRaw output: {json_str}")
+            print(f"[DEFINITIONS JSON ERROR] {e}\nRaw output: {json_str}")
             return None
     else:
-        print(f"[LLM NO JSON FOUND] Raw output: {response.text}")
+        print(f"[DEFINITIONS NO JSON FOUND] Raw output: {response.text}")
         return None
 
-# Adaptive LLM processor
-class AdaptiveLLMWorker(threading.Thread):
+def detect_action_items(text):
+    """Detect if the text contains action-oriented phrases"""
+    prompt = (
+        "Analyze the following transcript and detect if it contains any action-oriented phrases that would require the listener to take notes, create forms, start tasks, or perform any other actions. "
+        "Look for phrases like: 'note this down', 'create a note', 'write this down', 'remember this', 'action item', 'to-do', 'create a form', 'fill this form', 'start a task', 'follow up on', 'schedule', 'reminder', etc. "
+        "Return the result as a JSON object matching this schema:\n" + ACTION_DETECTION_SCHEMA + "\nTranscript:\n" + text
+    )
+    model = genai.GenerativeModel('gemini-2.0-flash')
+    response = model.generate_content(prompt)
+    match = re.search(r'\{[\s\S]*\}', response.text)
+    if match:
+        json_str = match.group(0)
+        try:
+            return json.loads(json_str)
+        except Exception as e:
+            print(f"[ACTION DETECTION JSON ERROR] {e}\nRaw output: {json_str}")
+            return None
+    else:
+        print(f"[ACTION DETECTION NO JSON FOUND] Raw output: {response.text}")
+        return None
+
+def generate_action_items(text, detected_actions):
+    """Generate specific action items based on the detected actions"""
+    prompt = (
+        "Based on the following transcript and detected action triggers, generate specific, actionable items that the listener should note down or act upon. "
+        "Make the action items clear, specific, and actionable. Consider the context and generate appropriate notes, forms, tasks, or reminders.\n"
+        f"Detected actions: {json.dumps(detected_actions, indent=2)}\n"
+        "Return the result as a JSON object matching this schema:\n" + ACTION_GENERATION_SCHEMA + "\nTranscript:\n" + text
+    )
+    model = genai.GenerativeModel('gemini-2.0-flash')
+    response = model.generate_content(prompt)
+    match = re.search(r'\{[\s\S]*\}', response.text)
+    if match:
+        json_str = match.group(0)
+        try:
+            return json.loads(json_str)
+        except Exception as e:
+            print(f"[ACTION GENERATION JSON ERROR] {e}\nRaw output: {json_str}")
+            return None
+    else:
+        print(f"[ACTION GENERATION NO JSON FOUND] Raw output: {response.text}")
+        return None
+
+# Enhanced LLM processor with action item detection
+class EnhancedLLMWorker(threading.Thread):
     def __init__(self, shared_state):
         super().__init__(daemon=True)
         self.shared_state = shared_state
@@ -163,12 +271,41 @@ class AdaptiveLLMWorker(threading.Thread):
             recent_text = self.shared_state.get_last_n_seconds()
             if recent_text.strip():
                 print(f"[LLM] Processing: {recent_text[:100]}...")
+                
+                # Process technical definitions (existing functionality)
                 definitions = get_gemini_definitions(recent_text)
+                
+                # Process action items (new functionality)
+                action_detection = detect_action_items(recent_text)
+                action_items_result = None
+                
+                if action_detection and action_detection.get('has_action_items', False):
+                    print(f"[ACTION] Detected action items: {len(action_detection.get('action_triggers', []))}")
+                    action_items_result = generate_action_items(recent_text, action_detection)
+                    
+                    if action_items_result:
+                        # Save action items to file
+                        action_obj = {
+                            "timestamp": datetime.utcnow().isoformat(),
+                            "transcript": recent_text,
+                            "detection": action_detection,
+                            "action_items": action_items_result,
+                            "activity_level": self.shared_state.activity_level
+                        }
+                        with open(ACTION_ITEMS_FILE, 'a', encoding='utf-8') as f:
+                            f.write(json.dumps(action_obj) + '\n')
+                        
+                        # Add to shared state
+                        self.shared_state.add_action_item(action_obj)
+                
+                # Save technical definitions (existing functionality)
                 if definitions:
                     obj = {
                         "timestamp": datetime.utcnow().isoformat(),
                         "transcript": recent_text,
                         "llm_output": definitions,
+                        "action_detection": action_detection,
+                        "action_items": action_items_result,
                         "activity_level": self.shared_state.activity_level,
                         "interval_used": interval
                     }
@@ -209,9 +346,10 @@ def start_session(session_config: Optional[SessionConfig] = None):
     llm_running.set()
     shared_state.transcription_buffer.clear()
     shared_state.llm_output = None
+    shared_state.action_items = []
     shared_state.activity_level = 0
     
-    llm_thread = AdaptiveLLMWorker(shared_state)
+    llm_thread = EnhancedLLMWorker(shared_state)
     llm_thread.start()
     
     return {
@@ -246,6 +384,26 @@ def get_latest_llm():
         raise HTTPException(status_code=404, detail="No LLM output yet.")
     return output
 
+@app.get("/action-items/latest")
+def get_latest_action_items():
+    """Get the most recent action items"""
+    action_items = shared_state.get_recent_action_items()
+    if not action_items:
+        raise HTTPException(status_code=404, detail="No action items yet.")
+    return {
+        "action_items": action_items,
+        "count": len(action_items)
+    }
+
+@app.get("/action-items/recent/{limit}")
+def get_recent_action_items(limit: int = 10):
+    """Get recent action items with a specified limit"""
+    action_items = shared_state.get_recent_action_items(limit)
+    return {
+        "action_items": action_items,
+        "count": len(action_items)
+    }
+
 @app.get("/session/status")
 def get_session_status():
     return {
@@ -253,24 +411,10 @@ def get_session_status():
         "config": shared_state.config,
         "activity_level": shared_state.activity_level,
         "buffer_size": len(shared_state.transcription_buffer),
-        "next_interval": shared_state.get_dynamic_interval()
+        "next_interval": shared_state.get_dynamic_interval(),
+        "action_items_count": len(shared_state.action_items)
     }
 
-# Health check
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "mode": "realtime"}3. Environment Variables (.env file)# Real-time configuration
-REACT_APP_CLIENT_POLLING_INTERVAL=1000
-REACT_APP_LLM_SEND_INTERVAL=2000
-REACT_APP_TRANSCRIPTION_WINDOW=8000
-REACT_APP_ACTIVITY_BOOST=0.5
-REACT_APP_QUIET_THRESHOLD=3000
-
-# Server configuration
-LLM_INTERVAL=2
-TRANSCRIPTION_WINDOW=8
-ACTIVITY_BOOST=0.5
-QUIET_THRESHOLD=5
-
-# API Keys
-GOOGLE_API_KEY=your_gemini_api_key_hereKey Real-time Features:Dynamic Polling: 500ms-2000ms based on speech activityActivity Detection: Tracks when user is actively speakingAdaptive LLM Processing: 1-4 second intervals based on activitySmart Buffering: Longer transcription windows when activeVisual Feedback: Shows real-time status and activity indicatorsConfigurable: All intervals adjustable via environment variablesPerformance Optimizations:50% faster polling when actively speaking2x slower processing during quiet periodsSmart windowing keeps more context when activeActivity decay gradually reduces processing frequencyStatus indicators show current polling rateThis gives you a truly responsive real-time experience while being efficient with API calls!
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
