@@ -1,545 +1,325 @@
-import React, { useState, useEffect, useRef } from 'react';
-import './App.css';
-import { FaMicrophone, FaGithub, FaSun, FaMoon, FaStop, FaClipboardList, FaExclamationCircle, FaCheckCircle, FaStickyNote } from 'react-icons/fa';
+/* Enhanced App.css with Action Items Support */
 
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
-const DEFINITIONS_CACHE_KEY = 'wf_teams_definitions_cache';
-const ACTION_ITEMS_CACHE_KEY = 'wf_teams_action_items_cache';
-
-function App() {
-  const [isRecording, setIsRecording] = useState(false);
-  const [transcription, setTranscription] = useState('');
-  const [interimTranscription, setInterimTranscription] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [darkMode, setDarkMode] = useState(false);
-  const [hasTranscribed, setHasTranscribed] = useState(false);
-  const [definitions, setDefinitions] = useState([]);
-  const [actionItems, setActionItems] = useState([]);
-  const [isSupported, setIsSupported] = useState(false);
-  const [activeTab, setActiveTab] = useState('definitions'); // 'definitions', 'context', 'actions'
-  
-  const recognitionRef = useRef(null);
-  const pollingRef = useRef(null);
-  const transcriptionBuffer = useRef([]);
-  const lastSentTime = useRef(0);
-
-  // Initialize Speech Recognition
-  useEffect(() => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    
-    if (SpeechRecognition) {
-      setIsSupported(true);
-      
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-      
-      recognition.onresult = (event) => {
-        let finalTranscript = '';
-        let interimTranscript = '';
-
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript;
-          } else {
-            interimTranscript += transcript;
-          }
-        }
-
-        if (finalTranscript) {
-          setTranscription(prev => {
-            const newTranscription = prev + finalTranscript;
-            transcriptionBuffer.current.push({
-              timestamp: new Date(),
-              text: finalTranscript
-            });
-            return newTranscription;
-          });
-          setHasTranscribed(true);
-        }
-        
-        setInterimTranscription(interimTranscript);
-      };
-
-      recognition.onstart = () => {
-        setIsRecording(true);
-        setLoading(false);
-      };
-
-      recognition.onend = () => {
-        setIsRecording(false);
-        setInterimTranscription('');
-      };
-
-      recognition.onerror = (event) => {
-        console.error('Speech recognition error:', event.error);
-        setIsRecording(false);
-        setLoading(false);
-        if (event.error === 'not-allowed') {
-          alert('Microphone access denied. Please allow microphone access and try again.');
-        }
-      };
-
-      recognitionRef.current = recognition;
-    }
-
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-    };
-  }, []);
-
-  // Load cached data on mount
-  useEffect(() => {
-    const cachedDefinitions = localStorage.getItem(DEFINITIONS_CACHE_KEY);
-    if (cachedDefinitions) {
-      try {
-        setDefinitions(JSON.parse(cachedDefinitions));
-      } catch {
-        setDefinitions([]);
-      }
-    }
-
-    const cachedActionItems = localStorage.getItem(ACTION_ITEMS_CACHE_KEY);
-    if (cachedActionItems) {
-      try {
-        setActionItems(JSON.parse(cachedActionItems));
-      } catch {
-        setActionItems([]);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    document.body.setAttribute('data-theme', darkMode ? 'dark' : 'light');
-  }, [darkMode]);
-
-  // Send transcription to server and poll for LLM output
-  useEffect(() => {
-    if (isRecording) {
-      pollingRef.current = setInterval(async () => {
-        // Send recent transcription to server for LLM processing
-        const now = Date.now();
-        const recentTranscription = getRecentTranscription(5000); // Last 5 seconds
-        
-        if (recentTranscription && now - lastSentTime.current > 3000) {
-          try {
-            await fetch(`${API_URL}/process-transcription`, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({ text: recentTranscription })
-            });
-            lastSentTime.current = now;
-          } catch (err) {
-            console.error('Error sending transcription:', err);
-          }
-        }
-
-        // Get latest LLM output (technical definitions)
-        try {
-          const res = await fetch(`${API_URL}/llm/latest`);
-          if (res.ok) {
-            const llmData = await res.json();
-            if (llmData.llm_output && llmData.llm_output.technical_terms) {
-              setDefinitions(prevDefs => {
-                const prevTerms = new Set(prevDefs.map(d => d.term));
-                const newDefs = llmData.llm_output.technical_terms.filter(d => d.term && !prevTerms.has(d.term));
-                const merged = [...prevDefs, ...newDefs];
-                localStorage.setItem(DEFINITIONS_CACHE_KEY, JSON.stringify(merged));
-                return merged;
-              });
-            }
-          }
-        } catch (err) {
-          console.error('Error fetching LLM output:', err);
-        }
-
-        // Get latest action items
-        try {
-          const actionRes = await fetch(`${API_URL}/action-items/latest`);
-          if (actionRes.ok) {
-            const actionData = await actionRes.json();
-            if (actionData.action_items && actionData.action_items.length > 0) {
-              setActionItems(prevItems => {
-                const allItems = [];
-                actionData.action_items.forEach(sessionData => {
-                  if (sessionData.action_items && sessionData.action_items.action_items) {
-                    sessionData.action_items.action_items.forEach(item => {
-                      allItems.push({
-                        ...item,
-                        timestamp: sessionData.timestamp,
-                        id: `${sessionData.timestamp}-${item.title}` // Simple ID generation
-                      });
-                    });
-                  }
-                });
-                
-                // Merge with existing items, avoiding duplicates
-                const existingIds = new Set(prevItems.map(item => item.id));
-                const newItems = allItems.filter(item => !existingIds.has(item.id));
-                const merged = [...prevItems, ...newItems];
-                localStorage.setItem(ACTION_ITEMS_CACHE_KEY, JSON.stringify(merged));
-                return merged;
-              });
-            }
-          }
-        } catch (err) {
-          console.error('Error fetching action items:', err);
-        }
-      }, 3000);
-    } else {
-      clearInterval(pollingRef.current);
-    }
-
-    return () => clearInterval(pollingRef.current);
-  }, [isRecording]);
-
-  const getRecentTranscription = (milliseconds) => {
-    const cutoff = new Date(Date.now() - milliseconds);
-    return transcriptionBuffer.current
-      .filter(item => item.timestamp >= cutoff)
-      .map(item => item.text)
-      .join(' ');
-  };
-
-  const handleStart = async () => {
-    if (!isSupported) {
-      alert('Speech recognition is not supported in this browser. Please use Chrome, Edge, or Safari.');
-      return;
-    }
-
-    setTranscription('');
-    setInterimTranscription('');
-    setLoading(true);
-    setHasTranscribed(false);
-    transcriptionBuffer.current = [];
-    lastSentTime.current = 0;
-
-    try {
-      // Start session on server
-      const res = await fetch(`${API_URL}/session/start`, { method: 'POST' });
-      if (res.ok) {
-        recognitionRef.current.start();
-      } else {
-        setLoading(false);
-        alert('Failed to start session on server.');
-      }
-    } catch (err) {
-      setLoading(false);
-      alert('Could not start session: ' + err.message);
-    }
-  };
-
-  const handleStop = async () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
-    
-    setLoading(true);
-    try {
-      const res = await fetch(`${API_URL}/session/stop`, { method: 'POST' });
-      setLoading(false);
-      if (!res.ok) {
-        alert('Failed to stop session on server.');
-      }
-    } catch (err) {
-      setLoading(false);
-      alert('Could not stop session: ' + err.message);
-    }
-  };
-
-  const handleClear = () => {
-    setDefinitions([]);
-    setActionItems([]);
-    localStorage.removeItem(DEFINITIONS_CACHE_KEY);
-    localStorage.removeItem(ACTION_ITEMS_CACHE_KEY);
-    setTranscription('');
-    setInterimTranscription('');
-    setHasTranscribed(false);
-    transcriptionBuffer.current = [];
-  };
-
-  const getPriorityIcon = (priority) => {
-    switch (priority?.toLowerCase()) {
-      case 'high':
-        return <FaExclamationCircle className="priority-icon high" />;
-      case 'medium':
-        return <FaExclamationCircle className="priority-icon medium" />;
-      case 'low':
-        return <FaCheckCircle className="priority-icon low" />;
-      default:
-        return <FaStickyNote className="priority-icon default" />;
-    }
-  };
-
-  const getActionTypeIcon = (type) => {
-    switch (type?.toLowerCase()) {
-      case 'note':
-        return <FaStickyNote className="action-type-icon note" />;
-      case 'form':
-        return <FaClipboardList className="action-type-icon form" />;
-      case 'task':
-        return <FaCheckCircle className="action-type-icon task" />;
-      case 'reminder':
-        return <FaExclamationCircle className="action-type-icon reminder" />;
-      default:
-        return <FaClipboardList className="action-type-icon default" />;
-    }
-  };
-
-  const DefinitionCard = ({ term, definition }) => (
-    <div className="card definition-card">
-      <div className="card-term">{term || <i>Unknown term</i>}</div>
-      <div className="card-definition">{definition || <i>No definition</i>}</div>
-    </div>
-  );
-
-  const ContextCard = ({ term, contextual_explanation, example_quote }) => (
-    <div className="card context-card">
-      <div className="card-term">{term || <i>Unknown term</i>}</div>
-      <div className="card-context">{contextual_explanation || <i>No context</i>}</div>
-      {example_quote && <div className="card-example"><b>Example:</b> "{example_quote}"</div>}
-    </div>
-  );
-
-  const ActionItemCard = ({ title, description, type, priority, context, suggested_content, timestamp }) => (
-    <div className="card action-item-card">
-      <div className="action-item-header">
-        <div className="action-item-title">
-          {getActionTypeIcon(type)}
-          <span>{title || <i>Untitled Action</i>}</span>
-        </div>
-        <div className="action-item-priority">
-          {getPriorityIcon(priority)}
-          <span className={`priority-text ${priority?.toLowerCase()}`}>
-            {priority || 'Normal'}
-          </span>
-        </div>
-      </div>
-      <div className="action-item-description">
-        {description || <i>No description</i>}
-      </div>
-      {suggested_content && (
-        <div className="action-item-content">
-          <b>Suggested Content:</b> {suggested_content}
-        </div>
-      )}
-      <div className="action-item-context">
-        <b>Context:</b> {context || <i>No context</i>}
-      </div>
-      <div className="action-item-meta">
-        <span className="action-type">{type || 'Action'}</span>
-        {timestamp && (
-          <span className="action-timestamp">
-            {new Date(timestamp).toLocaleTimeString()}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-
-  const renderDefinitions = () => {
-    if (!definitions || definitions.length === 0) {
-      return <div className="empty-state">No technical terms found yet.</div>;
-    }
-    return (
-      <div className="card-list">
-        {definitions.map((def, idx) => (
-          <DefinitionCard key={idx} term={def.term} definition={def.definition} />
-        ))}
-      </div>
-    );
-  };
-
-  const renderContext = () => {
-    if (!definitions || definitions.length === 0) {
-      return <div className="empty-state">No contextual explanations yet.</div>;
-    }
-    return (
-      <div className="card-list">
-        {definitions.map((def, idx) => (
-          <ContextCard key={idx} term={def.term} contextual_explanation={def.contextual_explanation} example_quote={def.example_quote} />
-        ))}
-      </div>
-    );
-  };
-
-  const renderActionItems = () => {
-    if (!actionItems || actionItems.length === 0) {
-      return <div className="empty-state">No action items detected yet.</div>;
-    }
-    return (
-      <div className="card-list">
-        {actionItems.map((item, idx) => (
-          <ActionItemCard 
-            key={item.id || idx} 
-            title={item.title}
-            description={item.description}
-            type={item.type}
-            priority={item.priority}
-            context={item.context}
-            suggested_content={item.suggested_content}
-            timestamp={item.timestamp}
-          />
-        ))}
-      </div>
-    );
-  };
-
-  const getTabContent = () => {
-    switch (activeTab) {
-      case 'definitions':
-        return renderDefinitions();
-      case 'context':
-        return renderContext();
-      case 'actions':
-        return renderActionItems();
-      default:
-        return renderDefinitions();
-    }
-  };
-
-  const getTabTitle = () => {
-    switch (activeTab) {
-      case 'definitions':
-        return 'Technical Definitions';
-      case 'context':
-        return 'Contextual Explanations';
-      case 'actions':
-        return 'Action Items';
-      default:
-        return 'Technical Definitions';
-    }
-  };
-
-  const getTabCounts = () => {
-    return {
-      definitions: definitions.length,
-      context: definitions.length,
-      actions: actionItems.length
-    };
-  };
-
-  if (!isSupported) {
-    return (
-      <div className={`app-root ${darkMode ? 'dark' : 'light'}`}>
-        <div style={{ padding: '20px', textAlign: 'center' }}>
-          <h2>Browser Not Supported</h2>
-          <p>Web Speech API is not supported in this browser.</p>
-          <p>Please use Chrome, Edge, or Safari for speech recognition.</p>
-        </div>
-      </div>
-    );
-  }
-
-  const tabCounts = getTabCounts();
-
-  return (
-    <div className={`app-root ${darkMode ? 'dark' : 'light'}`}>
-      <header className="app-header glass">
-        <div className="header-title">Meeting Insights</div>
-        <div className="header-actions">
-          <button className="icon-btn" title="GitHub Repo">
-            <FaGithub />
-          </button>
-          <button className="theme-toggle-pill" onClick={() => setDarkMode(dm => !dm)}>
-            {darkMode ? <FaSun /> : <FaMoon />}
-          </button>
-        </div>
-      </header>
-      
-      <div className="main-layout">
-        <div className="left-column transcript-column glass">
-          <div className="transcript-header">
-            <button
-              className={`record-btn${isRecording ? ' recording' : ''}`}
-              onClick={isRecording ? handleStop : handleStart}
-              disabled={loading}
-            >
-              {isRecording ? <><FaStop /> Stop</> : <><FaMicrophone /> Record</>}
-            </button>
-            <span className="status-text">
-              {isRecording ? 'Recording...' : loading ? 'Processing...' : 'Ready'}
-            </span>
-            <button
-              className="clear-session-btn"
-              onClick={handleClear}
-              title="Clear all definitions, explanations, action items, and transcript"
-            >
-              Clear Session
-            </button>
-          </div>
-          <div className="transcription-box glass">
-            <div className="transcription-content">
-              {!hasTranscribed && (
-                <div className="greeting"></div>
-              )}
-              <div className="mic-visualizer">
-                {isRecording ? (
-                  <div className="mic-anim">
-                    <FaMicrophone className="mic-icon recording" />
-                  </div>
-                ) : (
-                  <FaMicrophone className="mic-icon idle" />
-                )}
-              </div>
-              <div className="transcription-text fade-in">
-                {loading ? (
-                  <span>Starting...</span>
-                ) : (
-                  <span>
-                    {transcription || 'Hi there! Start speaking to transcribe your voice note.'}
-                    <span style={{ color: '#999' }}>{interimTranscription}</span>
-                  </span>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-        
-        <div className="right-column glass">
-          <div className="tab-navigation">
-            <button
-              className={`tab-btn ${activeTab === 'definitions' ? 'active' : ''}`}
-              onClick={() => setActiveTab('definitions')}
-            >
-              <FaClipboardList />
-              Definitions
-              {tabCounts.definitions > 0 && <span className="tab-count">{tabCounts.definitions}</span>}
-            </button>
-            <button
-              className={`tab-btn ${activeTab === 'context' ? 'active' : ''}`}
-              onClick={() => setActiveTab('context')}
-            >
-              <FaStickyNote />
-              Context
-              {tabCounts.context > 0 && <span className="tab-count">{tabCounts.context}</span>}
-            </button>
-            <button
-              className={`tab-btn ${activeTab === 'actions' ? 'active' : ''}`}
-              onClick={() => setActiveTab('actions')}
-            >
-              <FaExclamationCircle />
-              Actions
-              {tabCounts.actions > 0 && <span className="tab-count">{tabCounts.actions}</span>}
-            </button>
-          </div>
-          
-          <div className="tab-content">
-            <div className="column-title">{getTabTitle()}</div>
-            <div className="content-box card-scroll">
-              {getTabContent()}
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
+:root {
+  --primary-color: #4f46e5;
+  --secondary-color: #7c3aed;
+  --accent-color: #06b6d4;
+  --success-color: #10b981;
+  --warning-color: #f59e0b;
+  --error-color: #ef4444;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8fafc;
+  --bg-tertiary: #f1f5f9;
+  --text-primary: #1e293b;
+  --text-secondary: #64748b;
+  --text-muted: #94a3b8;
+  --border-color: #e2e8f0;
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  --glass-bg: rgba(255, 255, 255, 0.8);
+  --glass-border: rgba(255, 255, 255, 0.2);
+  --glass-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
 }
 
-export default App;
+[data-theme="dark"] {
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --bg-tertiary: #334155;
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-muted: #64748b;
+  --border-color: #334155;
+  --glass-bg: rgba(15, 23, 42, 0.8);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+  color: var(--text-primary);
+  min-height: 100vh;
+  transition: all 0.3s ease;
+}
+
+.app-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+}
+
+/* Header */
+.app-header {
+  padding: 1rem 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-radius: 0;
+  margin-bottom: 1rem;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.header-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--primary-color);
+}
+
+.header-actions {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.icon-btn {
+  padding: 0.5rem;
+  border: none;
+  background: rgba(79, 70, 229, 0.1);
+  color: var(--primary-color);
+  border-radius: 0.5rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.icon-btn:hover {
+  background: rgba(79, 70, 229, 0.2);
+  transform: translateY(-2px);
+}
+
+.theme-toggle-pill {
+  padding: 0.5rem 1rem;
+  border: none;
+  background: var(--primary-color);
+  color: white;
+  border-radius: 2rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.theme-toggle-pill:hover {
+  background: var(--secondary-color);
+  transform: translateY(-2px);
+}
+
+/* Main Layout */
+.main-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  padding: 0 2rem 2rem;
+  max-width: 1400px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.left-column {
+  display: flex;
+  flex-direction: column;
+  border-radius: 1rem;
+  overflow: hidden;
+}
+
+.right-column {
+  display: flex;
+  flex-direction: column;
+  border-radius: 1rem;
+  overflow: hidden;
+}
+
+/* Transcript Column */
+.transcript-column {
+  padding: 1.5rem;
+}
+
+.transcript-header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.record-btn {
+  padding: 0.75rem 1.5rem;
+  border: none;
+  background: linear-gradient(135deg, var(--primary-color), var(--secondary-color));
+  color: white;
+  border-radius: 2rem;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.record-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+}
+
+.record-btn.recording {
+  background: linear-gradient(135deg, var(--error-color), #dc2626);
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
+}
+
+.status-text {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+.clear-session-btn {
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 0.5rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-size: 0.9rem;
+}
+
+.clear-session-btn:hover {
+  background: var(--error-color);
+  color: white;
+  border-color: var(--error-color);
+}
+
+/* Transcription Box */
+.transcription-box {
+  flex: 1;
+  padding: 2rem;
+  border-radius: 1rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 300px;
+}
+
+.transcription-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 1rem;
+}
+
+.mic-visualizer {
+  margin-bottom: 1rem;
+}
+
+.mic-icon {
+  font-size: 3rem;
+  color: var(--text-muted);
+  transition: all 0.3s ease;
+}
+
+.mic-icon.recording {
+  color: var(--error-color);
+  animation: bounce 1s infinite;
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+.transcription-text {
+  font-size: 1.1rem;
+  line-height: 1.6;
+  color: var(--text-primary);
+  max-width: 100%;
+  word-wrap: break-word;
+}
+
+.fade-in {
+  animation: fadeIn 0.5s ease-in;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Tab Navigation */
+.tab-navigation {
+  display: flex;
+  background: var(--bg-tertiary);
+  border-radius: 0.5rem;
+  padding: 0.25rem;
+  margin: 1rem;
+  gap: 0.25rem;
+}
+
+.tab-btn {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 0.375rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  font-weight: 500;
+  font-size: 0.9rem;
+  position: relative;
+}
+
+.tab-btn.active {
+  background: var(--primary-color);
+  color: white;
+  box-shadow: var(--shadow-sm);
+}
+
+.tab-btn:hover:not(.active) {
+  background: rgba(79, 70, 229, 0.1);
+  color: var(--primary-color);
+}
+
+.tab-count {
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+  padding: 0.125rem 0.375rem;
+  border-radius: 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  min
